@@ -31,6 +31,7 @@ export interface SessionStorage {
 	write(path: string, content: string): void;
 	append(path: string, content: string): void;
 	openWriter(path: string): SessionStorageWriter;
+	close?(): Promise<void>;
 }
 
 class SynchronousSessionStorageWriter implements SessionStorageWriter {

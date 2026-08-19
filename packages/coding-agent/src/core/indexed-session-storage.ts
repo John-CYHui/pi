@@ -43,12 +43,14 @@ export class IndexedSessionStorage implements SessionStorage {
 	private pending: Promise<void> = Promise.resolve();
 	private initialized = false;
 	private readonly backend: IndexedSessionStorageBackend;
+	private readonly closeBackend?: () => Promise<void>;
 	private readonly fence: string;
 	private readonly sequences = new Map<string, number>();
 
-	constructor(backend: IndexedSessionStorageBackend, fence = randomUUID()) {
+	constructor(backend: IndexedSessionStorageBackend, fence: string = randomUUID(), closeBackend?: () => Promise<void>) {
 		this.backend = backend;
 		this.fence = fence;
+		this.closeBackend = closeBackend;
 	}
 
 	async initialize(): Promise<void> {
@@ -120,6 +122,11 @@ export class IndexedSessionStorage implements SessionStorage {
 	async drain(): Promise<void> {
 		await this.pending;
 		await Promise.all([...this.tails.values()]);
+	}
+
+	async close(): Promise<void> {
+		await this.drain();
+		await this.closeBackend?.();
 	}
 
 	private nextRevision(path: string): SessionStorageRevision {

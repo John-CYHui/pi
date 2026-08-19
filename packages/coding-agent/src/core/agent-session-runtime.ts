@@ -425,6 +425,7 @@ export class AgentSessionRuntime {
 		this.beforeSessionInvalidate?.();
 		await this.session.sessionManager.close();
 		this.session.dispose();
+		await this.session.sessionManager.closeStorage();
 	}
 }
 

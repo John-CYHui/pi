@@ -1,9 +1,22 @@
-import type { Collection, Db, MongoClient } from "mongodb";
-import type {
-	IndexedSessionStorageBackend,
-	IndexedSessionStorageEntry,
-	SessionStorageRevision,
-} from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { MongoClient, type Collection, type Db } from "mongodb";
+export interface SessionStorageRevision {
+	sequence: number;
+	fence: string;
+}
+
+export interface IndexedSessionStorageEntry {
+	path: string;
+	content: string;
+	mtimeMs: number;
+	revision: SessionStorageRevision;
+}
+
+export interface IndexedSessionStorageBackend {
+	load(): Promise<Iterable<IndexedSessionStorageEntry>>;
+	write(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void>;
+	append(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void>;
+}
 
 interface SessionDocument {
 	_id: string;
@@ -26,6 +39,52 @@ export interface MongoSessionBackendOptions {
 	database: string;
 	collectionPrefix?: string;
 	fence: string;
+}
+
+export interface MongoCredentialFile {
+	uri: string;
+	database: string;
+	collectionPrefix?: string;
+	fence?: string;
+}
+
+export async function createMongoSessionBackend(credentials: MongoCredentialFile): Promise<{
+	backend: MongoSessionStorageBackend;
+	close: () => Promise<void>;
+}> {
+	const client = new MongoClient(credentials.uri);
+	await client.connect();
+	const backend = new MongoSessionStorageBackend({
+		client,
+		database: credentials.database,
+		collectionPrefix: credentials.collectionPrefix,
+		fence: credentials.fence ?? randomUUID(),
+	});
+	await backend.initialize();
+	return { backend, close: () => client.close() };
+}
+
+export function parseMongoCredentialFile(value: unknown): MongoCredentialFile {
+	if (value === null || typeof value !== "object") throw new Error("MongoDB credential file must contain a JSON object");
+	const record = value as Record<string, unknown>;
+	if (typeof record.uri !== "string" || record.uri.length === 0) {
+		throw new Error('MongoDB credential file requires a non-empty "uri"');
+	}
+	if (typeof record.database !== "string" || record.database.length === 0) {
+		throw new Error('MongoDB credential file requires a non-empty "database"');
+	}
+	if (record.collectionPrefix !== undefined && typeof record.collectionPrefix !== "string") {
+		throw new Error('MongoDB credential file "collectionPrefix" must be a string');
+	}
+	if (record.fence !== undefined && typeof record.fence !== "string") {
+		throw new Error('MongoDB credential file "fence" must be a string');
+	}
+	return {
+		uri: record.uri,
+		database: record.database,
+		...(record.collectionPrefix !== undefined ? { collectionPrefix: record.collectionPrefix } : {}),
+		...(record.fence !== undefined ? { fence: record.fence } : {}),
+	};
 }
 
 export class MongoSessionStorageBackend implements IndexedSessionStorageBackend {
@@ -129,5 +188,3 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 		if (!this.initialized) throw new Error("MongoSessionStorageBackend.initialize() must be called first");
 	}
 }
-
-export type { IndexedSessionStorageBackend, IndexedSessionStorageEntry, SessionStorageRevision };

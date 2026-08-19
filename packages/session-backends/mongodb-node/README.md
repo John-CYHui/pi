@@ -27,6 +27,39 @@ await storage.initialize();
 const sessionManager = SessionManager.create(process.cwd(), undefined, { storage });
 ```
 
+## Native Pi CLI usage
+
+With the Pi CLI, pass the backend explicitly:
+
+```bash
+pi --session-backend mongodb
+```
+
+By default, Pi reads:
+
+```text
+app/.credential_store/mongodb.json
+```
+
+Override the file location with:
+
+```bash
+pi --session-backend mongodb --mongodb-credential path/to/mongodb.json
+```
+
+Example credential file:
+
+```json
+{
+  "uri": "mongodb://127.0.0.1:27017",
+  "database": "pi-dev",
+  "collectionPrefix": "pi_sessions",
+  "fence": "local-dev"
+}
+```
+
+The credential file should be protected as a secret and excluded from source control.
+
 ## Durability model
 
 - Session bodies are stored as one document per logical session path.

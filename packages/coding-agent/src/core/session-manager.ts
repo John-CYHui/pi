@@ -1020,6 +1020,10 @@ export class SessionManager {
 		this.writer = undefined;
 	}
 
+	async closeStorage(): Promise<void> {
+		await this.storage.close?.();
+	}
+
 	private _getWriter(): SessionStorageWriter {
 		if (!this.sessionFile) throw new Error("Cannot create a session writer without a session file");
 		return (this.writer ??= this.storage.openWriter(this.sessionFile));

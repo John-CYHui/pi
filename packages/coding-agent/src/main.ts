@@ -31,6 +31,7 @@ import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
+import { createSessionStorage } from "./cli/session-backend.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
 import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
@@ -56,6 +57,7 @@ import {
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import type { SessionStorage } from "./core/session-storage.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
@@ -347,9 +349,15 @@ function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
 	}
 }
 
-function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string, sessionId?: string): SessionManager {
+function forkSessionOrExit(
+	sourcePath: string,
+	cwd: string,
+	sessionDir?: string,
+	sessionId?: string,
+	storage?: SessionStorage,
+): SessionManager {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId });
+		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId, storage });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -362,9 +370,13 @@ export async function createSessionManager(
 	cwd: string,
 	sessionDir: string | undefined,
 	settingsManager: SettingsManager,
+	storage?: SessionStorage,
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
-		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
+		return SessionManager.inMemory(cwd, {
+			...(parsed.sessionId !== undefined ? { id: parsed.sessionId } : {}),
+			...(storage ? { storage } : {}),
+		});
 	}
 
 	if (parsed.fork) {
@@ -382,7 +394,7 @@ export async function createSessionManager(
 			case "path":
 			case "local":
 			case "global":
-				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId);
+				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId, storage);
 
 			case "not_found":
 				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
@@ -396,7 +408,7 @@ export async function createSessionManager(
 		switch (resolved.type) {
 			case "path":
 			case "local":
-				return openSessionOrExit(resolved.path, sessionDir);
+				return SessionManager.open(resolved.path, sessionDir, undefined, storage);
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
@@ -405,7 +417,7 @@ export async function createSessionManager(
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);
 				}
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved.path, cwd, sessionDir, undefined, storage);
 			}
 
 			case "not_found":
@@ -417,7 +429,7 @@ export async function createSessionManager(
 	if (parsed.resume) {
 		try {
 			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
+				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress, storage),
 				(onProgress) => SessionManager.listAll(sessionDir, onProgress),
 				settingsManager,
 			);
@@ -425,20 +437,20 @@ export async function createSessionManager(
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
 			}
-			return SessionManager.open(selectedPath, sessionDir);
+			return SessionManager.open(selectedPath, sessionDir, undefined, storage);
 		} finally {
 			stopThemeWatcher();
 		}
 	}
 
 	if (parsed.continue) {
-		return SessionManager.continueRecent(cwd, sessionDir);
+		return SessionManager.continueRecent(cwd, sessionDir, storage);
 	}
 
 	if (parsed.sessionId) {
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
-			return SessionManager.open(existingSession.path, sessionDir);
+			return SessionManager.open(existingSession.path, sessionDir, undefined, storage);
 		}
 		console.error(
 			chalk.yellow(
@@ -447,7 +459,10 @@ export async function createSessionManager(
 		);
 	}
 
-	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
+	return SessionManager.create(cwd, sessionDir, {
+		...(parsed.sessionId !== undefined ? { id: parsed.sessionId } : {}),
+		...(storage ? { storage } : {}),
+	});
 }
 
 function buildSessionOptions(
@@ -679,7 +694,20 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionStorage: SessionStorage | undefined;
+	try {
+		if (!parsed.noSession && parsed.sessionBackend === "mongodb") {
+			sessionStorage = await createSessionStorage(cwd, {
+				kind: parsed.sessionBackend,
+				credentialPath: parsed.mongodbCredential,
+			});
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Error: ${message}`));
+		process.exit(1);
+	}
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager, sessionStorage);
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -687,7 +715,12 @@ export async function main(args: string[], options?: MainOptions) {
 			if (!selectedCwd) {
 				process.exit(0);
 			}
-			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
+			sessionManager = SessionManager.open(
+				missingSessionCwdIssue.sessionFile!,
+				sessionDir,
+				selectedCwd,
+				sessionStorage,
+			);
 		} else {
 			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
 			process.exit(1);

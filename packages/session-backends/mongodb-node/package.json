@@ -27,7 +27,6 @@
   },
   "engines": { "node": ">=22.19.0" },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
     "mongodb": "7.5.0"
   },
   "devDependencies": {

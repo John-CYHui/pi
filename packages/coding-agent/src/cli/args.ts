@@ -28,6 +28,8 @@ export interface Args {
 	sessionId?: string;
 	fork?: string;
 	sessionDir?: string;
+	sessionBackend?: "file" | "mongodb";
+	mongodbCredential?: string;
 	models?: string[];
 	tools?: string[];
 	excludeTools?: string[];
@@ -119,6 +121,12 @@ export function parseArgs(args: string[]): Args {
 			result.fork = args[++i];
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
+		} else if (arg === "--session-backend" && i + 1 < args.length) {
+			const backend = args[++i];
+			if (backend === "file" || backend === "mongodb") result.sessionBackend = backend;
+			else result.diagnostics.push({ type: "error", message: `Invalid session backend "${backend}". Valid values: file, mongodb` });
+		} else if (arg === "--mongodb-credential" && i + 1 < args.length) {
+			result.mongodbCredential = args[++i];
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i].split(",").map((s) => s.trim());
 		} else if (arg === "--no-tools" || arg === "-nt") {
@@ -279,6 +287,8 @@ ${chalk.bold("Options:")}
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
+  --session-backend <backend>    Session backend: file or mongodb
+  --mongodb-credential <path>    MongoDB JSON credential file (default: app/.credential_store/mongodb.json)
   --no-session                   Don't save session (ephemeral)
   --name, -n <name>              Set session display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
