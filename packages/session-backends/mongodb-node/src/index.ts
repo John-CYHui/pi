@@ -72,9 +72,24 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 	}
 
 	async append(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void> {
-		const current = await this.sessions.findOne({ _id: path });
-		const nextContent = `${current?.content ?? ""}${content}`;
-		await this.commit(path, nextContent, mtimeMs, revision);
+		this.requireInitialized();
+		const result = await this.sessions.updateOne(
+			{ _id: path, sequence: revision.sequence - 1, fence: revision.fence },
+			[
+				{
+					$set: {
+						content: { $concat: [{ $ifNull: ["$content", ""] }, content] },
+						mtimeMs,
+						sequence: revision.sequence,
+						fence: revision.fence,
+						updatedAt: new Date(),
+					},
+				},
+			],
+		);
+		if (result.matchedCount !== 1) {
+			throw new Error(`MongoDB session revision conflict for ${path}`);
+		}
 	}
 
 	private async commit(
