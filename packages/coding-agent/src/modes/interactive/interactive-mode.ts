@@ -5190,11 +5190,16 @@ export class InteractiveMode {
 		this.showSelector((done) => {
 			const selector = new SessionSelectorComponent(
 				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
+					SessionManager.list(
+						this.sessionManager.getCwd(),
+						this.sessionManager.getSessionDir(),
+						onProgress,
+						this.sessionManager.getStorage(),
+					),
 				(onProgress) =>
 					this.sessionManager.usesDefaultSessionDir()
-						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+						? SessionManager.listAll(onProgress, this.sessionManager.getStorage())
+						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, this.sessionManager.getStorage()),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);
@@ -5211,7 +5216,12 @@ export class InteractiveMode {
 					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
-						const mgr = SessionManager.open(sessionFilePath);
+						const mgr = SessionManager.open(
+								sessionFilePath,
+								undefined,
+								undefined,
+								this.sessionManager.getStorage(),
+							);
 						mgr.appendSessionInfo(next);
 					},
 					showRenameHint: true,

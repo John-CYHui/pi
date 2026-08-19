@@ -1707,22 +1707,39 @@ export class SessionManager {
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]>;
-	static async listAll(sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+	static async listAll(onProgress?: SessionListProgress, storage?: SessionStorage): Promise<SessionInfo[]>;
+	static async listAll(
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		storage?: SessionStorage,
+	): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDirOrOnProgress?: string | SessionListProgress,
-		onProgress?: SessionListProgress,
+		onProgressOrStorage?: SessionListProgress | SessionStorage,
+		storage?: SessionStorage,
 	): Promise<SessionInfo[]> {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
-		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+		const progress =
+			typeof sessionDirOrOnProgress === "function"
+				? sessionDirOrOnProgress
+				: typeof onProgressOrStorage === "function"
+					? onProgressOrStorage
+					: undefined;
+		const backend =
+			storage ?? (typeof onProgressOrStorage === "object" ? onProgressOrStorage : new FileSessionStorage());
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress);
+			const sessions = await listSessionsFromDir(customSessionDir, progress, 0, undefined, backend);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		}
 
 		const sessionsDir = getSessionsDir();
+		if (storage) {
+			const sessions = await listSessionsFromDir(sessionsDir, progress, 0, undefined, storage);
+			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+			return sessions;
+		}
 
 		try {
 			if (!existsSync(sessionsDir)) {
