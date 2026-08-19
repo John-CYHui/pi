@@ -26,6 +26,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { FileSessionStorage, type SessionStorage, type SessionStorageWriter } from "./session-storage.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -41,6 +42,7 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	storage?: SessionStorage;
 }
 
 export interface SessionEntryBase {
@@ -632,25 +634,42 @@ function sessionCwdMatches(cwd: string | undefined, resolvedCwd: string): boolea
 }
 
 /** Exported for testing */
-export function findMostRecentSession(sessionDir: string, cwd?: string): string | null {
+export function findMostRecentSession(
+	sessionDir: string,
+	cwd?: string,
+	storage: SessionStorage = new FileSessionStorage(),
+): string | null {
 	const resolvedSessionDir = normalizePath(sessionDir);
 	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
 	try {
-		const files = readdirSync(resolvedSessionDir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => join(resolvedSessionDir, f))
-			.map((path) => ({ path, header: readSessionHeaderForDiscovery(path) }))
+		const files = storage
+			.listFiles(resolvedSessionDir, "*.jsonl")
+			.map((path) => ({ path, header: readSessionHeaderForDiscoveryFromStorage(path, storage) }))
 			.filter(
 				(file): file is { path: string; header: SessionHeader } =>
 					file.header !== null &&
 					(!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(file.header), resolvedCwd)),
 			)
-			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
-			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+			.map(({ path }) => ({ path, mtimeMs: storage.stat(path).mtimeMs }))
+			.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
 		return files[0]?.path || null;
 	} catch {
-		// Directory access and stat races make recent-session discovery unavailable.
+		return null;
+	}
+}
+
+function readSessionHeaderFromStorage(path: string, storage: SessionStorage): SessionHeader | null {
+	const entry = parseSessionEntryLine(storage.read(path).split("\n", 1)[0]);
+	return entry?.type === "session" && typeof (entry as SessionHeader).id === "string"
+		? (entry as SessionHeader)
+		: null;
+}
+
+function readSessionHeaderForDiscoveryFromStorage(path: string, storage: SessionStorage): SessionHeader | null {
+	try {
+		return readSessionHeaderFromStorage(path, storage);
+	} catch {
 		return null;
 	}
 }
@@ -684,9 +703,9 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+async function buildSessionInfo(filePath: string, storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo | null> {
 	try {
-		const stats = await stat(filePath);
+		const stats = storage.stat(filePath);
 		let header: SessionHeader | null = null;
 		let messageCount = 0;
 		let firstMessage = "";
@@ -694,12 +713,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		let name: string | undefined;
 		let lastActivityTime: number | undefined;
 
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
-			crlfDelay: Infinity,
-		});
-
-		for await (const line of rl) {
+		for (const line of storage.read(filePath).split("\n")) {
 			const entry = parseSessionEntryLine(line);
 			if (!entry) continue;
 
@@ -745,7 +759,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 				? new Date(lastActivityTime)
 				: !Number.isNaN(headerTime)
 					? new Date(headerTime)
-					: stats.mtime;
+					: new Date(stats.mtimeMs);
 
 		return {
 			path: filePath,
@@ -771,6 +785,7 @@ const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 async function buildSessionInfosWithConcurrency(
 	files: string[],
 	onLoaded: () => void,
+	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<(SessionInfo | null)[]> {
 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
 	const inFlight = new Set<Promise<void>>();
@@ -782,7 +797,7 @@ async function buildSessionInfosWithConcurrency(
 		if (!file) return;
 
 		let task: Promise<void>;
-		task = buildSessionInfo(file)
+		task = buildSessionInfo(file, storage)
 			.then((info) => {
 				results[index] = info;
 			})
@@ -813,22 +828,22 @@ async function listSessionsFromDir(
 	onProgress?: SessionListProgress,
 	progressOffset = 0,
 	progressTotal?: number,
+	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
-	if (!existsSync(dir)) {
+	if (!storage.listFiles(dir, "*.jsonl").length) {
 		return sessions;
 	}
 
 	try {
-		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const files = storage.listFiles(dir, "*.jsonl");
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
 		const results = await buildSessionInfosWithConcurrency(files, () => {
 			loaded++;
 			onProgress?.(progressOffset + loaded, total);
-		});
+		}, storage);
 		for (const info of results) {
 			if (info) {
 				sessions.push(info);
@@ -858,6 +873,9 @@ export class SessionManager {
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
+	private readonly storage: SessionStorage;
+	private writer: SessionStorageWriter | undefined;
+	private pendingWrites: Promise<void> = Promise.resolve();
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
@@ -876,8 +894,9 @@ export class SessionManager {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
-		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
-			mkdirSync(this.sessionDir, { recursive: true });
+		this.storage = newSessionOptions?.storage ?? new FileSessionStorage();
+		if (persist && this.sessionDir) {
+			this.storage.ensureDir(this.sessionDir);
 		}
 
 		if (sessionFile) {
@@ -894,14 +913,14 @@ export class SessionManager {
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+		if (this.storage.exists(this.sessionFile)) {
+			this.fileEntries = preloadedFileEntries ?? parseSessionEntries(this.storage.read(this.sessionFile));
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
 			if (this.fileEntries.length === 0) {
 				const explicitPath = this.sessionFile;
-				if (statSync(explicitPath).size > 0) {
+				if (this.storage.stat(explicitPath).size > 0) {
 					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
 				}
 				this.newSession();
@@ -978,14 +997,41 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
-		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
-		} finally {
-			closeSync(fd);
+		this.writer?.closeSync?.();
+		this.writer = undefined;
+		this.storage.write(this.sessionFile, this.fileEntries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+	}
+
+	/** Flush pending backend writes without changing the synchronous append contract. */
+	flushSync(): void {
+		this.writer?.flushSync?.();
+	}
+
+	/** Await all pending backend writes. Remote storage implementations should override this through their writer. */
+	async flush(): Promise<void> {
+		await this.pendingWrites;
+		await this.writer?.flush();
+	}
+
+	/** Close the active storage writer after flushing pending writes. */
+	async close(): Promise<void> {
+		await this.flush();
+		await this.writer?.close();
+		this.writer = undefined;
+	}
+
+	private _getWriter(): SessionStorageWriter {
+		if (!this.sessionFile) throw new Error("Cannot create a session writer without a session file");
+		return (this.writer ??= this.storage.openWriter(this.sessionFile));
+	}
+
+	private _appendSync(line: string): void {
+		const writer = this._getWriter();
+		if (writer.appendSync) {
+			writer.appendSync(line);
+			return;
 		}
+		this.pendingWrites = this.pendingWrites.then(() => writer.append(line));
 	}
 
 	isPersisted(): boolean {
@@ -998,6 +1044,10 @@ export class SessionManager {
 
 	getSessionDir(): string {
 		return this.sessionDir;
+	}
+
+	getStorage(): SessionStorage {
+		return this.storage;
 	}
 
 	usesDefaultSessionDir(): boolean {
@@ -1018,7 +1068,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				this._appendSync(`${JSON.stringify(entry)}\n`);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1027,17 +1077,10 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
+			this.storage.write(this.sessionFile, this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join(""));
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._appendSync(`${JSON.stringify(entry)}\n`);
 		}
 	}
 
@@ -1527,17 +1570,25 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory for /new or /branch. If omitted, derives from file's parent.
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
-	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+	static open(path: string, sessionDir?: string, cwdOverride?: string, storage?: SessionStorage): SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
-		if (cwdOverride === undefined && existsSync(resolvedPath)) {
+		if (cwdOverride === undefined && storage?.exists(resolvedPath)) {
+			try {
+				header = readSessionHeaderFromStorage(resolvedPath, storage);
+			} catch {
+				// The bounded filesystem scan is only a discovery optimization. The
+				// storage backend's full content remains authoritative.
+				preloadedFileEntries = parseSessionEntries(storage.read(resolvedPath));
+				const firstEntry = preloadedFileEntries[0];
+				header = firstEntry?.type === "session" ? firstEntry : null;
+			}
+		} else if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
 			} catch (error) {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
-				// The bounded scan is only a discovery optimization. A full load remains
-				// authoritative for legacy files with very large headers or prefixes.
 				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
@@ -1546,7 +1597,7 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(cwd, dir, resolvedPath, true, { storage }, preloadedFileEntries);
 	}
 
 	/**
@@ -1554,14 +1605,14 @@ export class SessionManager {
 	 * @param cwd Working directory
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
 	 */
-	static continueRecent(cwd: string, sessionDir?: string): SessionManager {
+	static continueRecent(cwd: string, sessionDir?: string, storage?: SessionStorage): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
-		const mostRecent = findMostRecentSession(dir, filterCwd ? cwd : undefined);
+		const mostRecent = findMostRecentSession(dir, filterCwd ? cwd : undefined, storage);
 		if (mostRecent) {
-			return new SessionManager(cwd, dir, mostRecent, true);
+			return new SessionManager(cwd, dir, mostRecent, true, { storage });
 		}
-		return new SessionManager(cwd, dir, undefined, true);
+		return new SessionManager(cwd, dir, undefined, true, { storage });
 	}
 
 	/** Create an in-memory session (no file persistence) */
@@ -1582,9 +1633,12 @@ export class SessionManager {
 		sessionDir?: string,
 		options?: NewSessionOptions,
 	): SessionManager {
+		const storage = options?.storage ?? new FileSessionStorage();
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceEntries = storage.exists(resolvedSourcePath)
+			? parseSessionEntries(storage.read(resolvedSourcePath))
+			: loadEntriesFromFile(resolvedSourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
@@ -1595,9 +1649,7 @@ export class SessionManager {
 		}
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
-		}
+		storage.ensureDir(dir);
 
 		// Create new session file with new ID but forked content
 		if (options?.id !== undefined) {
@@ -1617,16 +1669,12 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
+		const content = [newHeader, ...sourceEntries.filter((entry) => entry.type !== "session")]
+			.map((entry) => `${JSON.stringify(entry)}\n`)
+			.join("");
+		storage.write(newSessionFile, content);
 
-		// Copy all non-header entries from source
-		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
-			}
-		}
-
-		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true, { storage });
 	}
 
 	/**
@@ -1635,11 +1683,16 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(
+		cwd: string,
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
+		const sessions = (await listSessionsFromDir(dir, onProgress, 0, undefined, storage)).filter(
 			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());

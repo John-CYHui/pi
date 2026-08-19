@@ -251,6 +251,18 @@ export {
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type SessionStorage,
+	type SessionStorageWriter,
+} from "./core/session-storage.ts";
+export {
+	IndexedSessionStorage,
+	MemoryIndexedBackend,
+	type IndexedSessionStorageBackend,
+	type IndexedSessionStorageEntry,
+} from "./core/indexed-session-storage.ts";
+export {
 	type CompactionSettings,
 	type DefaultProjectTrust,
 	type FullscreenExitOutput,
