@@ -261,6 +261,7 @@ export {
 	MemoryIndexedBackend,
 	type IndexedSessionStorageBackend,
 	type IndexedSessionStorageEntry,
+	type SessionStorageRevision,
 } from "./core/indexed-session-storage.ts";
 export {
 	type CompactionSettings,
