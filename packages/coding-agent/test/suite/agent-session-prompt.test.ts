@@ -281,6 +281,133 @@ describe("AgentSession prompt characterization", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
+	it("gives extension commands invocation-scoped abort signals", async () => {
+		let commandSignal: AbortSignal | undefined;
+		let resolveStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("wait", {
+						handler: async (_args, ctx) => {
+							commandSignal = ctx.commandSignal;
+							resolveStarted?.();
+							await new Promise<void>((resolve) =>
+								ctx.commandSignal.addEventListener("abort", () => resolve(), { once: true }),
+							);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const command = harness.session.prompt("/wait");
+		await started;
+		expect(commandSignal?.aborted).toBe(false);
+		expect(harness.session.isCommandRunning).toBe(true);
+
+		await harness.session.abort();
+		await command;
+
+		expect(commandSignal?.aborted).toBe(true);
+		expect(harness.session.isCommandRunning).toBe(false);
+	});
+
+	it("aborts an outstanding command signal when the session is disposed", async () => {
+		let commandSignal: AbortSignal | undefined;
+		let resolveStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("wait", {
+						handler: async (_args, ctx) => {
+							commandSignal = ctx.commandSignal;
+							resolveStarted?.();
+							await new Promise<void>((resolve) =>
+								ctx.commandSignal.addEventListener("abort", () => resolve(), { once: true }),
+							);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const command = harness.session.prompt("/wait");
+		await started;
+		harness.session.dispose();
+		await command;
+
+		expect(commandSignal?.aborted).toBe(true);
+		expect(harness.session.isCommandRunning).toBe(false);
+	});
+
+	it("detaches a completed command signal from later aborts", async () => {
+		let completedSignal: AbortSignal | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("done", {
+						handler: async (_args, ctx) => {
+							completedSignal = ctx.commandSignal;
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("/done");
+		expect(completedSignal?.aborted).toBe(false);
+		expect(harness.session.isCommandRunning).toBe(false);
+
+		await harness.session.abort();
+		expect(completedSignal?.aborted).toBe(false);
+	});
+
+	it("aborts concurrent command invocations independently of agent streaming", async () => {
+		const signals: AbortSignal[] = [];
+		let resolveStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("wait", {
+						handler: async (_args, ctx) => {
+							signals.push(ctx.commandSignal);
+							if (signals.length === 2) resolveStarted?.();
+							await new Promise<void>((resolve) =>
+								ctx.commandSignal.addEventListener("abort", () => resolve(), { once: true }),
+							);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const first = harness.session.prompt("/wait first");
+		const second = harness.session.prompt("/wait second");
+		await started;
+		expect(signals).toHaveLength(2);
+		expect(harness.session.isStreaming).toBe(false);
+		expect(harness.session.isCommandRunning).toBe(true);
+
+		await harness.session.abort();
+		await Promise.all([first, second]);
+
+		expect(signals.every((signal) => signal.aborted)).toBe(true);
+		expect(harness.session.isCommandRunning).toBe(false);
+	});
+
 	it("extension sendUserMessage can opt into extension command dispatch", async () => {
 		let extensionApi: ExtensionAPI | undefined;
 		let resolveCommandRun: (args: string) => void = () => {};

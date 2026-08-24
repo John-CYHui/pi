@@ -750,7 +750,7 @@ export class ExtensionRunner {
 		};
 	}
 
-	createCommandContext(): ExtensionCommandContext {
+	createCommandContext(commandSignal: AbortSignal): ExtensionCommandContext {
 		// Use property descriptors instead of object spread so the guarded getters from
 		// createContext() stay lazy. A spread would eagerly read them once and freeze the
 		// old values into the returned object, bypassing stale-instance checks.
@@ -758,6 +758,13 @@ export class ExtensionRunner {
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as ExtensionCommandContext;
+		Object.defineProperty(context, "commandSignal", {
+			get: () => {
+				this.assertActive();
+				return commandSignal;
+			},
+			enumerable: true,
+		});
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
 			return this.getSystemPromptOptionsFn();

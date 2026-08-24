@@ -351,6 +351,9 @@ export interface ExtensionContext {
  * Includes session control methods only safe in user-initiated commands.
  */
 export interface ExtensionCommandContext extends ExtensionContext {
+	/** Signal scoped to this command invocation. Aborted when the user interrupts the command or the session is disposed. */
+	readonly commandSignal: AbortSignal;
+
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 

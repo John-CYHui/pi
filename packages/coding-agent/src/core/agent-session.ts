@@ -343,6 +343,7 @@ export class AgentSession {
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
+	private readonly _commandAbortControllers = new Set<AbortController>();
 	private _turnIndex = 0;
 
 	private _resourceLoader: ResourceLoader;
@@ -850,6 +851,7 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
+			this._abortCommands();
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -1292,8 +1294,9 @@ export class AgentSession {
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
 
-		// Get command context from extension runner (includes session control methods)
-		const ctx = this._extensionRunner.createCommandContext();
+		const abortController = new AbortController();
+		this._commandAbortControllers.add(abortController);
+		const ctx = this._extensionRunner.createCommandContext(abortController.signal);
 
 		try {
 			await command.handler(args, ctx);
@@ -1306,6 +1309,8 @@ export class AgentSession {
 				error: err instanceof Error ? err.message : String(err),
 			});
 			return true;
+		} finally {
+			this._commandAbortControllers.delete(abortController);
 		}
 	}
 
@@ -1552,11 +1557,24 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	/** Whether at least one extension command invocation is still running. */
+	get isCommandRunning(): boolean {
+		return this._commandAbortControllers.size > 0;
+	}
+
+	private _abortCommands(): void {
+		for (const controller of this._commandAbortControllers) {
+			controller.abort();
+		}
+	}
+
 	/**
-	 * Abort current operation and wait for agent to become idle.
+	 * Abort current agent and extension-command operations, then wait for the agent to become idle.
+	 * Command handlers unwind through their invocation-scoped commandSignal.
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this._abortCommands();
 		this.agent.abort();
 		await this.waitForIdle();
 	}
@@ -3411,14 +3429,20 @@ export class AgentSession {
 	// Extension System
 	// =========================================================================
 
-	createReplacedSessionContext(): ReplacedSessionContext {
+	async runWithReplacedSessionContext(callback: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
+		const abortController = new AbortController();
+		this._commandAbortControllers.add(abortController);
 		const context = Object.defineProperties(
 			{},
-			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
+			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext(abortController.signal)),
 		) as ReplacedSessionContext;
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
 		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);
-		return context;
+		try {
+			await callback(context);
+		} finally {
+			this._commandAbortControllers.delete(abortController);
+		}
 	}
 
 	/**

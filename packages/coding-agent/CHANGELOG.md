@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added invocation-scoped `ctx.commandSignal` cancellation for extension commands. TUI Escape, RPC abort, and session disposal abort active command signals without coupling them to model-turn `ctx.signal`.
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
 
 ### Fixed

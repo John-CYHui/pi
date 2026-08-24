@@ -190,7 +190,7 @@ export class AgentSessionRuntime {
 			await this.rebindSession(this.session);
 		}
 		if (withSession) {
-			await withSession(this.session.createReplacedSessionContext());
+			await this.session.runWithReplacedSessionContext(withSession);
 		}
 	}
 

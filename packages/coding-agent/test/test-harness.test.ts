@@ -317,8 +317,12 @@ describe("test harness", () => {
 			{ name: "shared-cmd", invocationName: "shared-cmd:2", description: "Beta command", path: "<beta>" },
 		]);
 
-		await runner!.getCommand("shared-cmd:1")?.handler("first", runner!.createCommandContext());
-		await runner!.getCommand("shared-cmd:2")?.handler("second", runner!.createCommandContext());
+		await runner!
+			.getCommand("shared-cmd:1")
+			?.handler("first", runner!.createCommandContext(new AbortController().signal));
+		await runner!
+			.getCommand("shared-cmd:2")
+			?.handler("second", runner!.createCommandContext(new AbortController().signal));
 
 		expect(calls).toEqual(["alpha:first", "beta:second"]);
 	});

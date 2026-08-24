@@ -1520,6 +1520,26 @@ pi.registerCommand("stats", {
 });
 ```
 
+Each invocation receives `ctx.commandSignal`, an `AbortSignal` scoped to that
+command. Pass it to abort-aware I/O. Pi aborts the signal when the user
+interrupts the command (Escape in the TUI or `abort` in RPC mode) and when the
+session is disposed. A completed command's signal is detached from later
+interruptions.
+
+```typescript
+pi.registerCommand("fetch-report", {
+  handler: async (_args, ctx) => {
+    const response = await fetch("https://example.com/report", {
+      signal: ctx.commandSignal,
+    });
+    ctx.ui.notify(await response.text(), "info");
+  },
+});
+```
+
+`ctx.commandSignal` is distinct from `ctx.signal`: `ctx.signal` belongs to the
+active model turn and is usually undefined for commands.
+
 Optional: add argument auto-completion for `/command ...`:
 
 ```typescript

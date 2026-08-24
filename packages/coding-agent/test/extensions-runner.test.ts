@@ -956,7 +956,7 @@ describe("ExtensionRunner", () => {
 				reload: async () => {},
 			});
 
-			const commandContext = runner.createCommandContext();
+			const commandContext = runner.createCommandContext(new AbortController().signal);
 			await commandContext.fork("entry-1");
 			expect(fork).toHaveBeenCalledWith("entry-1", undefined);
 
