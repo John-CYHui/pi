@@ -17,18 +17,9 @@ export interface IndexedSessionStorageEntry {
 
 export interface IndexedSessionStorageBackend {
 	load(): Promise<Iterable<IndexedSessionStorageEntry>>;
-	write(
-		path: string,
-		content: string,
-		mtimeMs: number,
-		revision: SessionStorageRevision,
-	): Promise<void>;
-	append(
-		path: string,
-		content: string,
-		mtimeMs: number,
-		revision: SessionStorageRevision,
-	): Promise<void>;
+	write(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void>;
+	append(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void>;
+	delete(path: string, revision: SessionStorageRevision): Promise<void>;
 }
 
 /**
@@ -47,7 +38,11 @@ export class IndexedSessionStorage implements SessionStorage {
 	private readonly fence: string;
 	private readonly sequences = new Map<string, number>();
 
-	constructor(backend: IndexedSessionStorageBackend, fence: string = randomUUID(), closeBackend?: () => Promise<void>) {
+	constructor(
+		backend: IndexedSessionStorageBackend,
+		fence: string = randomUUID(),
+		closeBackend?: () => Promise<void>,
+	) {
 		this.backend = backend;
 		this.fence = fence;
 		this.closeBackend = closeBackend;
@@ -56,7 +51,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	async initialize(): Promise<void> {
 		const entries = await this.backend.load();
 		for (const entry of entries) {
-			this.index.write(entry.path, entry.content);
+			this.index.restore(entry.path, entry.content, entry.mtimeMs);
 			this.sequences.set(entry.path, entry.revision.sequence);
 		}
 		this.initialized = true;
@@ -100,6 +95,13 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.enqueue(path, () => this.backend.append(path, content, mtimeMs, revision));
 	}
 
+	async delete(path: string): Promise<void> {
+		if (!this.index.exists(path)) throw new Error(`Session file not found: ${path}`);
+		const revision = this.nextRevision(path);
+		await this.enqueueAndWait(path, () => this.backend.delete(path, revision));
+		await this.index.delete(path);
+	}
+
 	openWriter(path: string): SessionStorageWriter {
 		let open = true;
 		let error: Error | undefined;
@@ -136,10 +138,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	private enqueue(path: string, operation: () => Promise<void>): void {
+		void this.enqueueAndWait(path, operation);
+	}
+
+	private enqueueAndWait(path: string, operation: () => Promise<void>): Promise<void> {
 		const previous = this.tails.get(path) ?? Promise.resolve();
 		const next = previous.then(operation);
 		this.tails.set(path, next);
 		this.pending = Promise.all([this.pending, next]).then(() => undefined);
+		return next;
 	}
 }
 
@@ -168,6 +175,12 @@ export class MemoryIndexedBackend implements IndexedSessionStorageBackend {
 		this.acceptRevision(path, revision);
 		const previous = this.files.get(path)?.content ?? "";
 		this.files.set(path, { path, content: `${previous}${content}`, mtimeMs, revision });
+	}
+
+	async delete(path: string, revision: SessionStorageRevision): Promise<void> {
+		await this.delay();
+		this.acceptRevision(path, revision);
+		this.files.delete(path);
 	}
 
 	private acceptRevision(path: string, revision: SessionStorageRevision): void {

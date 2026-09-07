@@ -1,21 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
-import {
-	appendFileSync,
-	closeSync,
-	createReadStream,
-	existsSync,
-	mkdirSync,
-	openSync,
-	readdirSync,
-	readSync,
-	statSync,
-	writeFileSync,
-} from "fs";
-import { readdir, stat } from "fs/promises";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } from "fs";
+import { readdir } from "fs/promises";
 import { join, resolve } from "path";
-import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
@@ -518,11 +506,11 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(resolvedFilePath)) return [];
 
 	const entries: FileEntry[] = [];
+	let pending = "";
 	const fd = openSync(resolvedFilePath, "r");
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-		let pending = "";
 
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
@@ -547,13 +535,14 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header
+	// Validate session header before repairing the file.
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
 		return [];
 	}
 
+	if (pending) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -611,16 +600,6 @@ function readSessionHeader(filePath: string): SessionHeader | null {
 		throw new SessionHeaderScanLimitError(filePath);
 	} finally {
 		closeSync(fd);
-	}
-}
-
-function readSessionHeaderForDiscovery(filePath: string): SessionHeader | null {
-	try {
-		return readSessionHeader(filePath);
-	} catch {
-		// Discovery is best-effort: unreadable or oversized files are not sessions,
-		// and one corrupt file must not prevent other sessions from being found.
-		return null;
 	}
 }
 
@@ -703,7 +682,10 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string, storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo | null> {
+async function buildSessionInfo(
+	filePath: string,
+	storage: SessionStorage = new FileSessionStorage(),
+): Promise<SessionInfo | null> {
 	try {
 		const stats = storage.stat(filePath);
 		let header: SessionHeader | null = null;
@@ -840,10 +822,14 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
-		const results = await buildSessionInfosWithConcurrency(files, () => {
-			loaded++;
-			onProgress?.(progressOffset + loaded, total);
-		}, storage);
+		const results = await buildSessionInfosWithConcurrency(
+			files,
+			() => {
+				loaded++;
+				onProgress?.(progressOffset + loaded, total);
+			},
+			storage,
+		);
 		for (const info of results) {
 			if (info) {
 				sessions.push(info);
@@ -901,6 +887,8 @@ export class SessionManager {
 
 		if (sessionFile) {
 			this._setSessionFile(sessionFile, preloadedFileEntries);
+		} else if (preloadedFileEntries?.length) {
+			this._loadEntries(preloadedFileEntries, newSessionOptions);
 		} else {
 			this.newSession(newSessionOptions);
 		}
@@ -914,11 +902,11 @@ export class SessionManager {
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (this.storage.exists(this.sessionFile)) {
-			this.fileEntries = preloadedFileEntries ?? parseSessionEntries(this.storage.read(this.sessionFile));
+			const entries = preloadedFileEntries ?? parseSessionEntries(this.storage.read(this.sessionFile));
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
-			if (this.fileEntries.length === 0) {
+			if (entries.length === 0) {
 				const explicitPath = this.sessionFile;
 				if (this.storage.stat(explicitPath).size > 0) {
 					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
@@ -930,14 +918,7 @@ export class SessionManager {
 				return;
 			}
 
-			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			this.sessionId = header?.id ?? createSessionId();
-
-			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
-			}
-
-			this._buildIndex();
+			this._loadEntries(entries);
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -972,6 +953,24 @@ export class SessionManager {
 			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
 		}
 		return this.sessionFile;
+	}
+
+	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
+
+		if (header) {
+			this.fileEntries = entries;
+			this.sessionId = header.id;
+
+			if (migrateToCurrentVersion(this.fileEntries)) {
+				this._rewriteFile();
+			}
+		} else {
+			this.newSession(options);
+			this.fileEntries = this.fileEntries.concat(entries);
+		}
+
+		this._buildIndex();
 	}
 
 	private _buildIndex(): void {
@@ -1026,7 +1025,8 @@ export class SessionManager {
 
 	private _getWriter(): SessionStorageWriter {
 		if (!this.sessionFile) throw new Error("Cannot create a session writer without a session file");
-		return (this.writer ??= this.storage.openWriter(this.sessionFile));
+		if (!this.writer) this.writer = this.storage.openWriter(this.sessionFile);
+		return this.writer;
 	}
 
 	private _appendSync(line: string): void {
@@ -1435,13 +1435,14 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		const fromId = this.leafId ?? "root";
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
-			fromId: branchFromId ?? "root",
+			fromId,
 			summary,
 			details,
 			usage,
@@ -1467,10 +1468,27 @@ export class SessionManager {
 		// Because labels are real tree entries, later entries can be children of labels;
 		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
 		const pathWithoutLabels: SessionEntry[] = [];
+		const replacementByLabelId = new Map<string, string>();
+		const pendingLabelIds: string[] = [];
 		let pathParentId: string | null = null;
 		for (const entry of path) {
-			if (entry.type === "label") continue;
-			pathWithoutLabels.push({ ...entry, parentId: pathParentId });
+			if (entry.type === "label") {
+				pendingLabelIds.push(entry.id);
+				continue;
+			}
+			for (const labelId of pendingLabelIds) {
+				replacementByLabelId.set(labelId, entry.id);
+			}
+			pendingLabelIds.length = 0;
+			pathWithoutLabels.push(
+				entry.type === "compaction"
+					? {
+							...entry,
+							parentId: pathParentId,
+							firstKeptEntryId: replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId,
+						}
+					: { ...entry, parentId: pathParentId },
+			);
 			pathParentId = entry.id;
 		}
 
@@ -1619,9 +1637,9 @@ export class SessionManager {
 		return new SessionManager(cwd, dir, undefined, true, { storage });
 	}
 
-	/** Create an in-memory session (no file persistence) */
-	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions): SessionManager {
-		return new SessionManager(cwd, "", undefined, false, options);
+	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
+	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
+		return new SessionManager(cwd, "", undefined, false, options, entries);
 	}
 
 	/**

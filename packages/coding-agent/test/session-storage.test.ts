@@ -2,12 +2,9 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	IndexedSessionStorage,
-	MemoryIndexedBackend,
-} from "../src/core/indexed-session-storage.ts";
-import { MemorySessionStorage, type SessionStorageWriter } from "../src/core/session-storage.ts";
+import { IndexedSessionStorage, MemoryIndexedBackend } from "../src/core/indexed-session-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { MemorySessionStorage, type SessionStorageWriter } from "../src/core/session-storage.ts";
 
 const tempDirs: string[] = [];
 
@@ -56,9 +53,10 @@ class DelayedMemorySessionStorage extends MemorySessionStorage {
 				);
 				return tail;
 			},
-			flush: () => tail.then(() => {
-				if (error) throw error;
-			}),
+			flush: () =>
+				tail.then(() => {
+					if (error) throw error;
+				}),
 			close: async () => {
 				await tail;
 				open = false;
@@ -105,7 +103,7 @@ describe("SessionStorage integration", () => {
 		expect(sessionFile).toBeDefined();
 		expect(storage.exists(sessionFile!)).toBe(true);
 
-		expect((await SessionManager.list(cwd, sessionDir, undefined, storage))).toHaveLength(1);
+		expect(await SessionManager.list(cwd, sessionDir, undefined, storage)).toHaveLength(1);
 		const reopened = SessionManager.open(sessionFile!, sessionDir, undefined, storage);
 		expect(reopened.getCwd()).toBe(cwd);
 		expect(reopened.getSessionId()).toBe(manager.getSessionId());
@@ -138,9 +136,25 @@ describe("SessionStorage integration", () => {
 		await manager.flush();
 		expect(storage.read(sessionFile)).toContain('"name":"indexed"');
 		await storage.drain();
+		const persistedMtimeMs = storage.stat(sessionFile).mtimeMs;
 		const reloaded = new IndexedSessionStorage(backend);
 		await reloaded.initialize();
 		expect(reloaded.read(sessionFile)).toContain('"name":"indexed"');
+		expect(reloaded.stat(sessionFile).mtimeMs).toBe(persistedMtimeMs);
+	});
+
+	it("deletes an indexed session through its backend", async () => {
+		const backend = new MemoryIndexedBackend();
+		const storage = new IndexedSessionStorage(backend, "writer-a");
+		await storage.initialize();
+		const manager = SessionManager.create("/project", "/sessions", { storage });
+		manager.appendMessage({ role: "assistant", content: [], timestamp: Date.now() } as never);
+		const sessionFile = manager.getSessionFile()!;
+		await manager.flush();
+
+		await storage.delete(sessionFile);
+		expect(storage.exists(sessionFile)).toBe(false);
+		await expect(storage.delete(sessionFile)).rejects.toThrow("Session file not found");
 	});
 
 	it("forks through the injected backend without filesystem access", () => {

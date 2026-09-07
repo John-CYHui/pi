@@ -30,6 +30,8 @@ export interface SessionStorage {
 	listFiles(dir: string, pattern: string): string[];
 	write(path: string, content: string): void;
 	append(path: string, content: string): void;
+	/** Optional durable deletion for non-file backends. */
+	delete?(path: string): Promise<void>;
 	openWriter(path: string): SessionStorageWriter;
 	close?(): Promise<void>;
 }
@@ -105,7 +107,9 @@ export class FileSessionStorage implements SessionStorage {
 	listFiles(dir: string, pattern: string): string[] {
 		if (pattern !== "*.jsonl") return [];
 		try {
-			return readdirSync(dir).filter((name) => name.endsWith(".jsonl")).map((name) => join(dir, name));
+			return readdirSync(dir)
+				.filter((name) => name.endsWith(".jsonl"))
+				.map((name) => join(dir, name));
 		} catch {
 			return [];
 		}
@@ -137,6 +141,11 @@ export class FileSessionStorage implements SessionStorage {
 export class MemorySessionStorage implements SessionStorage {
 	private readonly files = new Map<string, { content: string; mtimeMs: number }>();
 	private nextMtimeMs = Date.now();
+
+	restore(path: string, content: string, mtimeMs: number): void {
+		this.files.set(path, { content, mtimeMs });
+		this.nextMtimeMs = Math.max(this.nextMtimeMs, mtimeMs);
+	}
 
 	ensureDir(_path: string): void {}
 
@@ -171,6 +180,11 @@ export class MemorySessionStorage implements SessionStorage {
 	append(path: string, content: string): void {
 		const previous = this.files.get(path)?.content ?? "";
 		this.files.set(path, { content: `${previous}${content}`, mtimeMs: ++this.nextMtimeMs });
+	}
+
+	delete(path: string): Promise<void> {
+		if (!this.files.delete(path)) return Promise.reject(new Error(`Session file not found: ${path}`));
+		return Promise.resolve();
 	}
 
 	openWriter(path: string): SessionStorageWriter {

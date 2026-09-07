@@ -642,9 +642,9 @@ type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[
 /**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink
  */
-async function deleteSessionFile(
-	sessionPath: string,
-): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
+type DeleteSessionResult = { ok: boolean; method: "trash" | "unlink" | "backend"; error?: string };
+
+async function deleteSessionFile(sessionPath: string): Promise<DeleteSessionResult> {
 	// Try `trash` first (if installed)
 	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
 	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
@@ -754,6 +754,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		onExit: () => void,
 		requestRender: () => void,
 		options?: {
+			deleteSession?: (sessionPath: string) => Promise<void>;
 			renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
 			showRenameHint?: boolean;
 			keybindings?: KeybindingsManager;
@@ -830,7 +831,21 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await deleteSessionFile(sessionPath);
+			let result: DeleteSessionResult;
+			if (options?.deleteSession) {
+				try {
+					await options.deleteSession(sessionPath);
+					result = { ok: true, method: "backend" };
+				} catch (error) {
+					result = {
+						ok: false,
+						method: "backend",
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			} else {
+				result = await deleteSessionFile(sessionPath);
+			}
 
 			if (result.ok) {
 				if (this.currentSessions) {

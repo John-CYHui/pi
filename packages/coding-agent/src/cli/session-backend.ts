@@ -10,7 +10,10 @@ export interface SessionBackendOptions {
 	credentialPath?: string;
 }
 
-export async function createSessionStorage(cwd: string, options: SessionBackendOptions): Promise<SessionStorage | undefined> {
+export async function createSessionStorage(
+	cwd: string,
+	options: SessionBackendOptions,
+): Promise<SessionStorage | undefined> {
 	if (options.kind !== "mongodb") return undefined;
 
 	const credentialPath = resolve(cwd, options.credentialPath ?? "app/.credential_store/mongodb.json");

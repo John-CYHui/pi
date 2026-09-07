@@ -1,6 +1,6 @@
 {
   "name": "@earendil-works/pi-session-backend-mongodb-node",
-  "version": "0.84.2",
+  "version": "0.85.1",
   "description": "MongoDB session backend for Pi Coding Agent",
   "type": "module",
   "main": "./dist/index.js",

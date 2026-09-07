@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection, type Db, MongoClient } from "mongodb";
 export interface SessionStorageRevision {
 	sequence: number;
 	fence: string;
@@ -26,6 +26,7 @@ interface SessionDocument {
 	sequence: number;
 	fence: string;
 	updatedAt: Date;
+	deleted?: boolean;
 }
 
 interface FenceDocument {
@@ -65,7 +66,8 @@ export async function createMongoSessionBackend(credentials: MongoCredentialFile
 }
 
 export function parseMongoCredentialFile(value: unknown): MongoCredentialFile {
-	if (value === null || typeof value !== "object") throw new Error("MongoDB credential file must contain a JSON object");
+	if (value === null || typeof value !== "object")
+		throw new Error("MongoDB credential file must contain a JSON object");
 	const record = value as Record<string, unknown>;
 	if (typeof record.uri !== "string" || record.uri.length === 0) {
 		throw new Error('MongoDB credential file requires a non-empty "uri"');
@@ -117,7 +119,7 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 
 	async load(): Promise<Iterable<IndexedSessionStorageEntry>> {
 		this.requireInitialized();
-		const rows = await this.sessions.find({}).toArray();
+		const rows = await this.sessions.find({ deleted: { $ne: true } }).toArray();
 		return rows.map((row) => ({
 			path: row.path,
 			content: row.content,
@@ -133,7 +135,7 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 	async append(path: string, content: string, mtimeMs: number, revision: SessionStorageRevision): Promise<void> {
 		this.requireInitialized();
 		const result = await this.sessions.updateOne(
-			{ _id: path, sequence: revision.sequence - 1, fence: revision.fence },
+			{ _id: path, sequence: revision.sequence - 1, fence: revision.fence, deleted: { $ne: true } },
 			[
 				{
 					$set: {
@@ -151,6 +153,25 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 		}
 	}
 
+	async delete(path: string, revision: SessionStorageRevision): Promise<void> {
+		this.requireInitialized();
+		const result = await this.sessions.updateOne(
+			{ _id: path, sequence: revision.sequence - 1, fence: revision.fence, deleted: { $ne: true } },
+			{
+				$set: {
+					content: "",
+					mtimeMs: Date.now(),
+					sequence: revision.sequence,
+					deleted: true,
+					updatedAt: new Date(),
+				},
+			},
+		);
+		if (result.matchedCount !== 1) {
+			throw new Error(`MongoDB session revision conflict for ${path}`);
+		}
+	}
+
 	private async commit(
 		path: string,
 		content: string,
@@ -161,10 +182,8 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 		const result = await this.sessions.updateOne(
 			{
 				_id: path,
-				$or: [
-					{ sequence: revision.sequence - 1, fence: revision.fence },
-					{ sequence: { $exists: false } },
-				],
+				deleted: { $ne: true },
+				$or: [{ sequence: revision.sequence - 1, fence: revision.fence }, { sequence: { $exists: false } }],
 			},
 			{
 				$set: {
@@ -174,6 +193,7 @@ export class MongoSessionStorageBackend implements IndexedSessionStorageBackend 
 					mtimeMs,
 					sequence: revision.sequence,
 					fence: revision.fence,
+					deleted: false,
 					updatedAt: new Date(),
 				},
 			},

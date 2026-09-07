@@ -20,8 +20,6 @@ describe("parseMongoCredentialFile", () => {
 
 	it("rejects missing connection details", () => {
 		expect(() => parseMongoCredentialFile({ database: "pi-dev" })).toThrow('requires a non-empty "uri"');
-		expect(() => parseMongoCredentialFile({ uri: "mongodb://localhost" })).toThrow(
-			'requires a non-empty "database"',
-		);
+		expect(() => parseMongoCredentialFile({ uri: "mongodb://localhost" })).toThrow('requires a non-empty "database"');
 	});
 });
