@@ -28,6 +28,15 @@ const allowedExternalPackages = new Set([
 	"utf-8-validate",
 	// Optional debug output coloring.
 	"supports-color",
+	// MongoDB driver's peer-optional integrations. The driver catches a missing
+	// module and reports an actionable error only when the corresponding
+	// authentication, compression, encryption, or proxy feature is selected.
+	"@aws-sdk/credential-providers",
+	"@mongodb-js/zstd",
+	"kerberos",
+	"mongodb-client-encryption",
+	"snappy",
+	"socks",
 ]);
 
 const lazyJitiPlugin = {
