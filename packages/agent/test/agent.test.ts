@@ -298,6 +298,134 @@ describe("Agent", () => {
 		expect(receivedSignal?.aborted).toBe(true);
 	});
 
+	it("executes a tool through validation, hooks, cancellation context, and lifecycle events without transcript messages", async () => {
+		const toolSchema = Type.Object({ value: Type.Number() });
+		const events: AgentEvent[] = [];
+		const hookArguments: unknown[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: number }> = {
+			name: "double",
+			label: "Double",
+			description: "Doubles a number",
+			parameters: toolSchema,
+			prepareArguments: (arguments_) => ({
+				value: Number((arguments_ as { value: unknown }).value),
+			}),
+			async execute(_toolCallId, params, signal, onUpdate) {
+				expect(signal).toBeInstanceOf(AbortSignal);
+				onUpdate?.({ content: [{ type: "text", text: "working" }], details: { value: params.value } });
+				return {
+					content: [{ type: "text", text: String(params.value * 2) }],
+					details: { value: params.value * 2 },
+				};
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			beforeToolCall: async ({ args }) => {
+				hookArguments.push(args);
+				return undefined;
+			},
+			afterToolCall: async ({ args, result }) => {
+				hookArguments.push(args, result.details);
+				return { content: [{ type: "text", text: "filtered" }] };
+			},
+			streamFn: unusedStreamFunction,
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		const executed = await agent.executeTool("double", { value: "4" });
+
+		expect(executed.isError).toBe(false);
+		expect(executed.result.content).toEqual([{ type: "text", text: "filtered" }]);
+		expect(executed.result.details).toEqual({ value: 8 });
+		expect(hookArguments).toEqual([{ value: 4 }, { value: 4 }, { value: 8 }]);
+		expect(events.map((event) => event.type)).toEqual([
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+		]);
+		expect(agent.state.messages).toEqual([]);
+		expect(agent.state.pendingToolCalls.size).toBe(0);
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
+	it("returns bounded tool errors for invalid arguments, blocked calls, unknown tools, and thrown execution", async () => {
+		const toolSchema = Type.Object({ value: Type.Number() });
+		let executionCount = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "strict",
+			label: "Strict",
+			description: "Requires a number",
+			parameters: toolSchema,
+			async execute() {
+				executionCount++;
+				throw new Error("execution failed");
+			},
+		};
+		const agent = new Agent({ initialState: { tools: [tool] }, streamFn: unusedStreamFunction });
+
+		const invalid = await agent.executeTool("strict", { value: "not-a-number" });
+		expect(invalid.isError).toBe(true);
+		expect(executionCount).toBe(0);
+
+		agent.beforeToolCall = async () => ({ block: true, reason: "approval denied" });
+		const blocked = await agent.executeTool("strict", { value: 1 });
+		expect(blocked.isError).toBe(true);
+		expect(blocked.result.content).toEqual([{ type: "text", text: "approval denied" }]);
+		expect(executionCount).toBe(0);
+
+		agent.beforeToolCall = undefined;
+		const thrown = await agent.executeTool("strict", { value: 1 });
+		expect(thrown.isError).toBe(true);
+		expect(thrown.result.content).toEqual([{ type: "text", text: "execution failed" }]);
+		expect(executionCount).toBe(1);
+
+		const unknown = await agent.executeTool("missing", {});
+		expect(unknown.isError).toBe(true);
+		expect(unknown.result.content).toEqual([{ type: "text", text: "Tool missing not found" }]);
+		expect(agent.state.messages).toEqual([]);
+	});
+
+	it("aborts an active programmatic tool and participates in idle settlement", async () => {
+		const started = createDeferred();
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "wait",
+			label: "Wait",
+			description: "Waits for cancellation",
+			parameters: toolSchema,
+			execute: async (_toolCallId, _params, signal) => {
+				started.resolve();
+				await new Promise<void>((_resolve, reject) => {
+					if (signal?.aborted) {
+						reject(new Error("aborted"));
+						return;
+					}
+					signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				});
+				return { content: [], details: {} };
+			},
+		};
+		const agent = new Agent({ initialState: { tools: [tool] }, streamFn: unusedStreamFunction });
+		const execution = agent.executeTool("wait", {});
+		await started.promise;
+		let idle = false;
+		const idlePromise = agent.waitForIdle().then(() => {
+			idle = true;
+		});
+		expect(idle).toBe(false);
+
+		agent.abort();
+		const result = await execution;
+		await idlePromise;
+
+		expect(result.isError).toBe(true);
+		expect(idle).toBe(true);
+		expect(agent.signal).toBeUndefined();
+	});
+
 	it("should ignore tool updates after the tool execution settles", async () => {
 		const toolSchema = Type.Object({});
 		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;

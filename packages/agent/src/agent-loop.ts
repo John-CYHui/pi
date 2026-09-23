@@ -428,6 +428,56 @@ type ExecutedToolCallBatch = {
 	terminate: boolean;
 };
 
+/** Finalized result of executing one tool through the agent tool lifecycle. */
+export interface ExecutedToolCall {
+	toolCall: AgentToolCall;
+	result: AgentToolResult<unknown>;
+	isError: boolean;
+}
+
+/**
+ * Execute one tool call through argument preparation, schema validation, hooks,
+ * cancellation, and tool lifecycle events without creating a transcript message.
+ */
+export async function executeToolCall(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCall: AgentToolCall,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ExecutedToolCall> {
+	await emit({
+		type: "tool_execution_start",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
+		args: toolCall.arguments,
+	});
+
+	const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+	let finalized: FinalizedToolCallOutcome;
+	if (preparation.kind === "immediate") {
+		finalized = {
+			toolCall,
+			result: preparation.result,
+			isError: preparation.isError,
+		};
+	} else {
+		const executed = await executePreparedToolCall(preparation, signal, emit);
+		finalized = await finalizeExecutedToolCall(
+			currentContext,
+			assistantMessage,
+			preparation,
+			executed,
+			config,
+			signal,
+		);
+	}
+
+	await emitToolExecutionEnd(finalized, emit);
+	return finalized;
+}
+
 async function executeToolCallsSequential(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -440,34 +490,7 @@ async function executeToolCallsSequential(
 	const messages: ToolResultMessage[] = [];
 
 	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
-		});
-
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
-		let finalized: FinalizedToolCallOutcome;
-		if (preparation.kind === "immediate") {
-			finalized = {
-				toolCall,
-				result: preparation.result,
-				isError: preparation.isError,
-			};
-		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
-			finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
-		}
-
-		await emitToolExecutionEnd(finalized, emit);
+		const finalized = await executeToolCall(currentContext, assistantMessage, toolCall, config, signal, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);

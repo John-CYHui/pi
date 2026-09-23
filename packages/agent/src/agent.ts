@@ -1,13 +1,15 @@
-import type {
-	ImageContent,
-	Message,
-	Model,
-	SimpleStreamOptions,
-	TextContent,
-	ThinkingBudgets,
-	Transport,
+import {
+	type AssistantMessage,
+	type ImageContent,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	type TextContent,
+	type ThinkingBudgets,
+	type Transport,
+	uuidv7,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type ExecutedToolCall, executeToolCall, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -355,6 +357,66 @@ export class Agent {
 		}
 		const messages = this.normalizePromptInput(input, images);
 		await this.runPromptMessages(messages);
+	}
+
+	/**
+	 * Execute one active tool through the normal validation, hook, cancellation,
+	 * and lifecycle-event pipeline without adding messages to the transcript.
+	 */
+	async executeTool(
+		toolName: string,
+		arguments_: Record<string, unknown>,
+		options: { signal?: AbortSignal } = {},
+	): Promise<ExecutedToolCall> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before executing a tool.");
+		}
+
+		const abortController = new AbortController();
+		let resolvePromise = () => {};
+		const promise = new Promise<void>((resolve) => {
+			resolvePromise = resolve;
+		});
+		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this._state.errorMessage = undefined;
+
+		const abortFromCaller = () => abortController.abort(options.signal?.reason);
+		if (options.signal?.aborted) {
+			abortFromCaller();
+		} else {
+			options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+		}
+
+		const toolCall = {
+			type: "toolCall",
+			id: uuidv7(),
+			name: toolName,
+			arguments: arguments_,
+		} as const;
+		const assistantMessage = {
+			role: "assistant",
+			content: [toolCall],
+			api: this._state.model.api,
+			provider: this._state.model.provider,
+			model: this._state.model.id,
+			usage: EMPTY_USAGE,
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		} satisfies AssistantMessage;
+
+		try {
+			return await executeToolCall(
+				this.createContextSnapshot(),
+				assistantMessage,
+				toolCall,
+				this.createLoopConfig(),
+				abortController.signal,
+				(event) => this.processEvents(event),
+			);
+		} finally {
+			options.signal?.removeEventListener("abort", abortFromCaller);
+			this.finishRun();
+		}
 	}
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */

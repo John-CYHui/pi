@@ -1,7 +1,63 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
+import { FileSessionStorage, type SessionStorageWriter } from "../../src/core/session-storage.ts";
+
+class FailingAppendStorage extends FileSessionStorage {
+	override openWriter(_path: string): SessionStorageWriter {
+		return {
+			append: () => Promise.reject(new Error("audit storage failed")),
+			appendSync: () => {
+				throw new Error("audit storage failed");
+			},
+			flush: () => Promise.resolve(),
+			close: () => Promise.resolve(),
+			isOpen: () => true,
+			getError: () => undefined,
+		};
+	}
+}
 
 describe("SessionManager.saveCustomEntry", () => {
+	it("rolls back tree state when synchronous persistence fails", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-session-rollback-"));
+		try {
+			const session = SessionManager.create(root, join(root, "sessions"), {
+				storage: new FailingAppendStorage(),
+			});
+			session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+			session.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "hi" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "test",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			});
+			const entriesBefore = session.getEntries();
+			const leafBefore = session.getLeafId();
+
+			expect(() => session.appendCustomEntry("audit", { safe: true })).toThrow("audit storage failed");
+
+			expect(session.getEntries()).toEqual(entriesBefore);
+			expect(session.getLeafId()).toBe(leafBefore);
+			expect(session.getBranch().map((entry) => entry.id)).toEqual(entriesBefore.map((entry) => entry.id));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("saves custom entries and includes them in tree traversal", () => {
 		const session = SessionManager.inMemory();
 

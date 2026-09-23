@@ -7,6 +7,8 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type ExecutedTool,
+	type ExecuteToolOptions,
 	type ModelCycleResult,
 	type PromptOptions,
 	type SessionStats,

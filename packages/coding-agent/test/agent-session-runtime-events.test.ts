@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -204,6 +205,49 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		);
 		runtimeHost.setBeforeSessionInvalidate(undefined);
 		runtimeHost.setRebindSession(undefined);
+	});
+
+	it("aborts and settles programmatic tool execution before replacing the session", async () => {
+		let signalStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.registerTool({
+				name: "replace_blocking_tool",
+				label: "Replace Blocking Tool",
+				description: "Waits until session replacement aborts it",
+				parameters: Type.Object({}),
+				execute: async (_toolCallId, _params, signal) => {
+					signalStarted();
+					await new Promise<void>((_resolve, reject) => {
+						if (signal?.aborted) {
+							reject(new Error("aborted for replacement"));
+							return;
+						}
+						signal?.addEventListener("abort", () => reject(new Error("aborted for replacement")), { once: true });
+					});
+					return { content: [], details: {} };
+				},
+			});
+		});
+		const oldSession = runtimeHost.session;
+		const terminalEvents: string[] = [];
+		const unsubscribe = oldSession.subscribe((event) => {
+			if (event.type.startsWith("tool_execution_")) terminalEvents.push(event.type);
+		});
+		const execution = oldSession.executeTool("replace_blocking_tool", {});
+		await started;
+
+		const replacement = runtimeHost.newSession();
+		const result = await execution;
+		await replacement;
+
+		expect(result.isError).toBe(true);
+		expect(terminalEvents).toEqual(["tool_execution_start", "tool_execution_end"]);
+		expect(runtimeHost.session).not.toBe(oldSession);
+		await expect(oldSession.executeTool("replace_blocking_tool", {})).rejects.toThrow("Session is disposed");
+		unsubscribe();
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {

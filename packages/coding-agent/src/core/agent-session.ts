@@ -22,6 +22,7 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	AgentToolResult,
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -187,6 +188,17 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
+export interface ExecuteToolOptions {
+	signal?: AbortSignal;
+}
+
+export interface ExecutedTool {
+	toolCallId: string;
+	toolName: string;
+	result: AgentToolResult<unknown>;
+	isError: boolean;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -320,6 +332,13 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _activeToolExecutions = 0;
+	private _sessionMutationAdmissions = 0;
+	private _toolAdmissionReservations = 0;
+	private _toolAbortController: AbortController | undefined;
+	private _disposed = false;
+	private _disposeCleanupScheduled = false;
+	private _disposeCleanupFinished = false;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -880,17 +899,38 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._disposed) return;
+		this._disposed = true;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
 			this._abortCommands();
+			this._toolAbortController?.abort(new Error("Session disposed"));
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
+		if (this._activeToolExecutions > 0) {
+			this._disposeCleanupScheduled = true;
+			void this.agent.waitForIdle().finally(() => this._finishDispose());
+			return;
+		}
+		this._finishDispose();
+	}
+
+	private _finishDispose(): void {
+		if (
+			!this._disposed ||
+			this._disposeCleanupFinished ||
+			(this._disposeCleanupScheduled && this._activeToolExecutions > 0)
+		) {
+			return;
+		}
+		this._disposeCleanupScheduled = false;
+		this._disposeCleanupFinished = true;
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -925,7 +965,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.isCompacting;
+		return !this._isAgentRunActive && this._activeToolExecutions === 0 && !this.isCompacting;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -970,6 +1010,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		this._assertAvailableForSessionMutation("change active tools");
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -1159,6 +1200,8 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._assertAvailableForSessionMutation("submit a prompt");
+		this._sessionMutationAdmissions++;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1305,14 +1348,18 @@ export class AgentSession {
 				this._systemPromptOverride = undefined;
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
+			// Reserve the model-run state before releasing asynchronous preflight
+			// admission so standalone tools cannot enter during the handoff.
+			this._isAgentRunActive = true;
 		} catch (error) {
 			preflightResult?.(false);
 			throw error;
+		} finally {
+			this._sessionMutationAdmissions--;
+			this._resolveIdleWaitIfIdle();
 		}
 
-		if (!messages) {
-			return;
-		}
+		if (!messages) return;
 
 		preflightResult?.(true);
 		await this._runAgentPrompt(messages);
@@ -1347,6 +1394,7 @@ export class AgentSession {
 			return true;
 		} finally {
 			this._commandAbortControllers.delete(abortController);
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -1390,6 +1438,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertAvailableForSessionMutation("queue a steering message");
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1410,6 +1459,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertAvailableForSessionMutation("queue a follow-up message");
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1488,6 +1538,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._assertAvailableForSessionMutation("send a custom message");
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -1638,6 +1689,7 @@ export class AgentSession {
 		this._abortCommands();
 		this.abortCompaction();
 		this.abortBranchSummary();
+		this._toolAbortController?.abort(new Error("Session operation aborted"));
 		this.agent.abort();
 		await this.waitForIdle();
 	}
@@ -1647,6 +1699,81 @@ export class AgentSession {
 			return;
 		}
 		await this._getIdleWaitPromise();
+	}
+
+	/**
+	 * Execute one currently active tool through Pi's session-owned tool lifecycle.
+	 * The result is returned directly and is not appended to the model transcript.
+	 */
+	async executeTool(
+		toolName: string,
+		arguments_: Record<string, unknown>,
+		options: ExecuteToolOptions = {},
+	): Promise<ExecutedTool> {
+		if (this._disposed) {
+			throw new Error("Session is disposed.");
+		}
+		if (
+			!this.isIdle ||
+			this._sessionMutationAdmissions > 0 ||
+			this._toolAdmissionReservations > 0 ||
+			this.isBashRunning ||
+			this.isCommandRunning
+		) {
+			throw new Error("Session is already processing. Wait for completion before executing a tool.");
+		}
+
+		const abortController = new AbortController();
+		this._toolAbortController = abortController;
+		const callerSignal = options.signal;
+		const forwardCallerAbort = () => abortController.abort(callerSignal?.reason);
+		if (callerSignal?.aborted) {
+			forwardCallerAbort();
+		} else {
+			callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
+		}
+
+		this._activeToolExecutions++;
+		try {
+			const executed = await this.agent.executeTool(toolName, arguments_, {
+				signal: abortController.signal,
+			});
+			if (!this._disposed) {
+				try {
+					this.sessionManager.appendCustomEntry("pi.programmatic_tool_execution", {
+						toolCallId: executed.toolCall.id,
+						toolName: executed.toolCall.name,
+						isError: executed.isError,
+					});
+				} catch {
+					// The tool effect has completed. Audit persistence must not make the
+					// completed operation appear retryable to the caller.
+				}
+			}
+			return {
+				toolCallId: executed.toolCall.id,
+				toolName: executed.toolCall.name,
+				result: executed.result,
+				isError: executed.isError,
+			};
+		} finally {
+			callerSignal?.removeEventListener("abort", forwardCallerAbort);
+			if (this._toolAbortController === abortController) {
+				this._toolAbortController = undefined;
+			}
+			this._activeToolExecutions--;
+			this._resolveIdleWaitIfIdle();
+			if (this._disposed) this._finishDispose();
+		}
+	}
+
+	private _assertAvailableForSessionMutation(operation: string): void {
+		if (this._disposed) {
+			throw new Error("Session is disposed.");
+		}
+		if (this._activeToolExecutions > 0) {
+			throw new Error(`Cannot ${operation} while a programmatic tool is running.`);
+		}
 	}
 
 	// =========================================================================
@@ -1674,25 +1801,32 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		this._assertAvailableForSessionMutation("change the model");
+		this._sessionMutationAdmissions++;
+		try {
+			if (!(await this._modelRuntime.checkAuth(model.provider))) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
+
+			const previousModel = this.model;
+			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+			this.agent.state.model = model;
+			this.sessionManager.appendModelChange(model.provider, model.id);
+			if (options.persist) {
+				this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+				this._addPersistedDefaultToNonEmptyScope(model);
+			}
+
+			// Apply thinking level for the new model.
+			// Per-model thinking level overrides take priority over the global default.
+			// Model persistence does not implicitly rewrite the global thinking default.
+			this.setThinkingLevel(thinkingLevel);
+
+			await this._emitModelSelect(model, previousModel, "set");
+		} finally {
+			this._sessionMutationAdmissions--;
+			this._resolveIdleWaitIfIdle();
 		}
-
-		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		if (options.persist) {
-			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-			this._addPersistedDefaultToNonEmptyScope(model);
-		}
-
-		// Apply thinking level for the new model.
-		// Per-model thinking level overrides take priority over the global default.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
-
-		await this._emitModelSelect(model, previousModel, "set");
 	}
 
 	private _addPersistedDefaultToNonEmptyScope(model: Model<any>): void {
@@ -1719,10 +1853,17 @@ export class AgentSession {
 		direction: "forward" | "backward" = "forward",
 		options: ModelMutationOptions = {},
 	): Promise<ModelCycleResult | undefined> {
-		if (this._scopedModels.length > 0) {
-			return this._cycleScopedModel(direction, options);
+		this._assertAvailableForSessionMutation("cycle the model");
+		this._sessionMutationAdmissions++;
+		try {
+			if (this._scopedModels.length > 0) {
+				return await this._cycleScopedModel(direction, options);
+			}
+			return await this._cycleAvailableModel(direction, options);
+		} finally {
+			this._sessionMutationAdmissions--;
+			this._resolveIdleWaitIfIdle();
 		}
-		return this._cycleAvailableModel(direction, options);
 	}
 
 	private async _cycleScopedModel(
@@ -1809,6 +1950,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		this._assertAvailableForSessionMutation("change the thinking level");
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -1962,6 +2104,16 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (this._disposed) throw new Error("Session is disposed.");
+		this._toolAdmissionReservations++;
+		try {
+			return await this._compact(customInstructions);
+		} finally {
+			this._toolAdmissionReservations--;
+		}
+	}
+
+	private async _compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
@@ -2834,6 +2986,17 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._assertAvailableForSessionMutation("reload extensions");
+		this._sessionMutationAdmissions++;
+		try {
+			await this._reload(options);
+		} finally {
+			this._sessionMutationAdmissions--;
+			this._resolveIdleWaitIfIdle();
+		}
+	}
+
+	private async _reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3003,6 +3166,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		this._assertAvailableForSessionMutation("execute bash");
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -3029,6 +3193,7 @@ export class AgentSession {
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -3037,6 +3202,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._assertAvailableForSessionMutation("record a bash result");
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -3131,6 +3297,20 @@ export class AgentSession {
 	async navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		this._assertAvailableForSessionMutation("navigate the session tree");
+		this._sessionMutationAdmissions++;
+		try {
+			return await this._navigateTree(targetId, options);
+		} finally {
+			this._sessionMutationAdmissions--;
+			this._resolveIdleWaitIfIdle();
+		}
+	}
+
+	private async _navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
@@ -3529,6 +3709,7 @@ export class AgentSession {
 			await callback(context);
 		} finally {
 			this._commandAbortControllers.delete(abortController);
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
