@@ -198,7 +198,8 @@ const TOGETHER_REASONING_ONLY_MODELS = new Set([
 	"MiniMaxAI/MiniMax-M2.7",
 ]);
 const TOGETHER_REASONING_EFFORT_MODELS = new Set(["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
-const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro"]);
+// https://docs.together.ai/docs/reasoning-overview documents high/max reasoning_effort for this model.
+const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro-0813"]);
 const TOGETHER_FIXED_REASONING_LEVEL_MAP = {
 	off: null,
 	minimal: null,
@@ -211,10 +212,11 @@ const TOGETHER_REASONING_EFFORT_LEVEL_MAP = {
 } as const;
 const TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	minimal: null,
-	low: null,
-	medium: null,
-	high: "high",
-	xhigh: null,
+	low: "high",
+	medium: "high",
+	high: "max",
+	xhigh: "max",
+	max: "max",
 } as const;
 const TOGETHER_TOGGLE_REASONING_LEVEL_MAP = {
 	minimal: null,
@@ -2174,8 +2176,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		// Process Kimi For Coding models
-		if (data["kimi-for-coding"]?.models) {
-			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
+		if (data["kimi-code-plan-global"]?.models) {
+			const kimiModels = data["kimi-code-plan-global"].models;
 			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
 
 			const kimiAliases = new Set(["k2p5", "k2p6", "k2p7"]);

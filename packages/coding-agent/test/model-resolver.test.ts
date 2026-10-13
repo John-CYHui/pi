@@ -720,6 +720,12 @@ describe("default model selection", () => {
 		expect(defaultModelPerProvider["ant-ling"]).toBe("Ring-2.6-1T");
 	});
 
+	test("Kimi provider defaults use current catalog IDs", () => {
+		expect(defaultModelPerProvider.fireworks).toBe("accounts/fireworks/models/kimi-k3");
+		expect(defaultModelPerProvider.together).toBe("moonshotai/Kimi-K3");
+		expect(defaultModelPerProvider["opencode-go"]).toBe("kimi-k3");
+	});
+
 	test("built-in defaults exist in generated provider catalogs", () => {
 		for (const provider of getBuiltinProviders()) {
 			const defaultId = defaultModelPerProvider[provider];

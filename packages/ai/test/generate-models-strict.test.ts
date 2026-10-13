@@ -84,4 +84,75 @@ describe("strict model generation", () => {
 		);
 		expect(generatedPaths.map((path) => readFileSync(join(packageRoot, path), "utf8"))).toEqual(sourceBefore);
 	});
+
+	it("keeps the global Kimi Coding catalog when models.dev publishes code-plan keys", () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-generate-models-"));
+		temporaryRoots.push(fixtureRoot);
+		const isolatedPackageRoot = join(fixtureRoot, "package");
+		mkdirSync(isolatedPackageRoot);
+		for (const entry of ["package.json", "scripts", "src"]) {
+			cpSync(join(packageRoot, entry), join(isolatedPackageRoot, entry), { recursive: true });
+		}
+		const preloadPath = join(fixtureRoot, "mock-models-dev.mjs");
+		const modelIds = ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"];
+		const models = Object.fromEntries(
+			modelIds.map((id) => [
+				id,
+				{
+					id,
+					name: `Global ${id}`,
+					tool_call: true,
+					reasoning: true,
+					limit: { context: 262144, output: 32768 },
+					modalities: { input: ["text", "image"] },
+				},
+			]),
+		);
+		const individualIds = [
+			"deepseek-v4-flash-0731",
+			"deepseek-v4-pro",
+			"deepseek-v4-pro-0813",
+			"glm-5.2",
+			"qwen3.6-flash",
+			"qwen3.7-max",
+			"qwen3.7-plus",
+			"qwen3.8-flash",
+			"qwen3.8-max",
+		];
+		const catalog = {
+			"kimi-code-plan-global": { models },
+			"kimi-code-plan-cn": { models: { k3: { ...models.k3, name: "CN K3" } } },
+			"alibaba-token-plan": {
+				models: Object.fromEntries(individualIds.map((id) => [id, { id, name: id, tool_call: true }])),
+			},
+		};
+		writeFileSync(
+			preloadPath,
+			`const catalog = ${JSON.stringify(catalog)};\n` +
+				`globalThis.fetch = async (input) => {\n` +
+				`  if (String(input) === "https://models.dev/api.json") {\n` +
+				`    return new Response(JSON.stringify(catalog), { status: 200 });\n` +
+				`  }\n` +
+				`  if (["https://openrouter.ai/api/v1/models", "https://ai-gateway.vercel.sh/v1/models"].includes(String(input))) {\n` +
+				`    return new Response(JSON.stringify({ data: [] }), { status: 200 });\n` +
+				`  }\n` +
+				`  throw new Error(\`Unexpected fetch: \${String(input)}\`);\n` +
+				`};\n`,
+		);
+
+		const result = spawnSync(
+			process.execPath,
+			["--import", pathToFileURL(preloadPath).href, "scripts/generate-models.ts", "--strict"],
+			{ cwd: isolatedPackageRoot, encoding: "utf8", timeout: 10_000 },
+		);
+		expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+		const aggregator = readFileSync(join(isolatedPackageRoot, "src/models.generated.ts"), "utf8");
+		expect(aggregator).toContain('"kimi-coding": KIMI_CODING_MODELS');
+		const generated = JSON.parse(
+			readFileSync(join(isolatedPackageRoot, "src/providers/data/kimi-coding.json"), "utf8"),
+		) as { "anthropic-messages": Record<string, { name: string; cost: { input: number } }> };
+		expect(Object.keys(generated["anthropic-messages"]).sort()).toEqual(modelIds.sort());
+		expect(generated["anthropic-messages"].k3.name).toBe("Global k3");
+		expect(generated["anthropic-messages"].k3.cost.input).toBe(3);
+	});
 });

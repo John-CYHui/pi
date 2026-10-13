@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertMessages } from "../src/api/openai-completions.ts";
 import { getModel, stream, streamSimple } from "../src/compat.ts";
 import type { AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
+import { legacyOpenCodeGoKimi } from "./legacy-opencode-go-kimi-model.ts";
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -77,6 +78,7 @@ const localOpenAICompletionsModel = {
 type CapturedParams = {
 	chat_template_kwargs?: Record<string, unknown>;
 	thinking?: unknown;
+	reasoning?: { enabled: boolean };
 	reasoning_effort?: string;
 };
 
@@ -275,6 +277,25 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBe("medium");
 	});
 
+	it("maps Together DeepSeek V4 Pro 0813 reasoning effort and toggle", async () => {
+		const model = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+		for (const [reasoning, effort] of [
+			["low", "high"],
+			["medium", "high"],
+			["high", "max"],
+			["xhigh", "max"],
+			["max", "max"],
+		] as const) {
+			const params = await captureSimpleParams(model, reasoning);
+			expect(params.reasoning).toEqual({ enabled: true });
+			expect(params.reasoning_effort).toBe(effort);
+		}
+
+		const offParams = await captureSimpleParams(model);
+		expect(offParams.reasoning).toEqual({ enabled: false });
+		expect(offParams.reasoning_effort).toBeUndefined();
+	});
+
 	it("enables tool_stream for supported z.ai models with tools", async () => {
 		const model = getModel("zai", "glm-5.2")!;
 		const tools: Tool[] = [
@@ -320,21 +341,25 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("stores z.ai effort metadata", () => {
-		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			for (const modelId of ["glm-5.2", "glm-5.2-highspeed"] as const) {
-				const model = getModel(provider, modelId)!;
-				expect(model.compat?.supportsReasoningEffort).toBe(true);
-				expect(model.thinkingLevelMap).toEqual({
-					off: "none",
-					minimal: null,
-					low: null,
-					medium: null,
-					high: "high",
-					xhigh: null,
-					max: "max",
-				});
-			}
+		for (const model of [
+			getModel("zai", "glm-5.2"),
+			getModel("zai", "glm-5.2-highspeed"),
+			getModel("zai-coding-cn", "glm-5.3"),
+			getModel("zai-coding-cn", "glm-5.3-highspeed"),
+		]) {
+			const provider = model.provider;
+			expect(model.compat?.supportsReasoningEffort).toBe(true);
+			expect(model.thinkingLevelMap).toEqual({
+				...(provider === "zai" ? { off: "none", low: null } : { off: null, low: "low" }),
+				minimal: null,
+				medium: null,
+				high: "high",
+				xhigh: null,
+				max: "max",
+			});
+		}
 
+		for (const provider of ["zai", "zai-coding-cn"] as const) {
 			const glm53 = getModel(provider, "glm-5.3")!;
 			expect(glm53.compat?.supportsReasoningEffort).toBe(true);
 			expect(glm53.thinkingLevelMap).toEqual({
@@ -1244,8 +1269,7 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
-		const model = { ...baseModel, api: "openai-completions" } as const;
+		const model = legacyOpenCodeGoKimi;
 		const response = await streamSimple(
 			model,
 			{
@@ -1291,8 +1315,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("replays OpenCode Go reasoning thinking blocks as reasoning_content", () => {
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
-		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
+		const model = legacyOpenCodeGoKimi;
 		const messages = convertMessages(
 			model,
 			{
@@ -1350,7 +1373,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking disabled for OpenCode Go Kimi K2.6 when thinking is off", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
+		const model = legacyOpenCodeGoKimi;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1372,7 +1395,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking enabled for OpenCode Go Kimi K2.6 when thinking is enabled", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
+		const model = legacyOpenCodeGoKimi;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1443,7 +1466,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "kimi-k2.6")!] as const;
+		const cases = [legacyOpenCodeGoKimi, getModel("opencode", "kimi-k2.6")] as const;
 
 		for (const model of cases) {
 			let payload: unknown;
