@@ -1,4 +1,4 @@
-import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { constants, copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
@@ -12,7 +12,36 @@ import type {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
-import { SessionManager } from "./session-manager.ts";
+import { parseSessionEntries, SessionManager } from "./session-manager.ts";
+
+/** A proposed destination; reservation callbacks run before any destination content is written. */
+export interface ReplacementDestination {
+	operation: "fork" | "import";
+	sourcePath: string;
+	destinationPath: string;
+	destinationId: string;
+	/** False for a root or lazy fork (or an import already stored at the destination path). */
+	willWriteImmediately: boolean;
+}
+
+/** Acknowledgement of a reserved replacement; uncertain means teardown or commit may have partially completed. */
+export interface ReplacementOutcome extends ReplacementDestination {
+	status: "committed" | "aborted" | "uncertain";
+}
+
+/** Opt-in host callbacks for coordinating a session replacement with external resources. */
+export interface ReplacementHooks {
+	/** Return false to cancel before writing or tearing down the source. Must not mutate the destination file. */
+	// biome-ignore lint/suspicious/noConfusingVoidType: A reservation callback may omit a return value.
+	reserveDestination(destination: ReplacementDestination): boolean | void;
+	/** Called only after the outgoing session has been fully torn down. */
+	onSourceTeardown?(destination: ReplacementDestination): void;
+	/** Called once if reservation was attempted, including if the callback throws. */
+	onDestinationSettled?(outcome: ReplacementOutcome): void;
+}
+
+/** Internal signal for a reservation veto; not exposed to callers. */
+class ReplacementVetoError extends Error {}
 
 /**
  * Result returned by runtime creation.
@@ -271,7 +300,11 @@ export class AgentSessionRuntime {
 
 	async fork(
 		entryId: string,
-		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		options?: {
+			position?: "before" | "at";
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			replacementHooks?: ReplacementHooks;
+		},
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
@@ -297,49 +330,111 @@ export class AgentSessionRuntime {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (this.session.sessionManager.isPersisted()) {
-			const currentSessionFile = this.session.sessionFile;
-			if (!currentSessionFile) {
-				throw new Error("Persisted session is missing a session file");
+		const hooks = options?.replacementHooks;
+		if (hooks && !this.session.sessionManager.isPersisted()) {
+			throw new Error("Replacement hooks require a persisted fork destination");
+		}
+		let destination: ReplacementDestination | undefined;
+		let status: ReplacementOutcome["status"] = "aborted";
+		/** Reserve before writing; a veto is handled by the outer replacement boundary. */
+		const reserve = (candidate: ReplacementDestination): void => {
+			destination = candidate;
+			status = "uncertain";
+			if (hooks?.reserveDestination(candidate) === false) {
+				status = "aborted";
+				throw new ReplacementVetoError();
 			}
-			const sessionDir = this.session.sessionManager.getSessionDir();
-			if (!targetLeafId) {
-				const sessionManager = SessionManager.create(this.cwd, sessionDir, {
-					storage: this.session.sessionManager.getStorage(),
-				});
-				sessionManager.newSession({ parentSession: currentSessionFile });
+		};
+		try {
+			if (this.session.sessionManager.isPersisted()) {
+				const currentSessionFile = this.session.sessionFile;
+				if (!currentSessionFile) {
+					throw new Error("Persisted session is missing a session file");
+				}
+				const sessionDir = this.session.sessionManager.getSessionDir();
+				if (!targetLeafId) {
+					const sessionManager = SessionManager.create(this.cwd, sessionDir, {
+						storage: this.session.sessionManager.getStorage(),
+					});
+					sessionManager.newSession({ parentSession: currentSessionFile });
+					if (hooks) {
+						const newSessionFile = sessionManager.getSessionFile();
+						if (!newSessionFile) throw new Error("Persisted fork is missing a destination file");
+						reserve({
+							operation: "fork",
+							sourcePath: currentSessionFile,
+							destinationPath: newSessionFile,
+							destinationId: sessionManager.getSessionId(),
+							willWriteImmediately: false,
+						});
+					}
+					await this.teardownCurrent("fork", sessionManager.getSessionFile());
+					if (destination) hooks?.onSourceTeardown?.(destination);
+					this.apply(
+						await this.createRuntime({
+							cwd: this.cwd,
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						}),
+					);
+					await this.finishSessionReplacement(options?.withSession);
+					status = "committed";
+					return { cancelled: false, selectedText };
+				}
+
+				if (!this.session.sessionManager.getStorage().exists(currentSessionFile)) {
+					throw new Error(
+						"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
+					);
+				}
+				const sessionManager = SessionManager.open(
+					currentSessionFile,
+					sessionDir,
+					undefined,
+					this.session.sessionManager.getStorage(),
+				);
+				const forkedSessionPath = sessionManager.createBranchedSession(
+					targetLeafId,
+					hooks
+						? (candidate) =>
+								reserve({
+									operation: "fork",
+									sourcePath: currentSessionFile,
+									destinationPath: candidate.path,
+									destinationId: candidate.id,
+									willWriteImmediately: candidate.willWriteImmediately,
+								})
+						: undefined,
+				);
+				if (!forkedSessionPath) {
+					throw new Error("Failed to create forked session");
+				}
 				await this.teardownCurrent("fork", sessionManager.getSessionFile());
+				if (destination) hooks?.onSourceTeardown?.(destination);
 				this.apply(
 					await this.createRuntime({
-						cwd: this.cwd,
+						cwd: sessionManager.getCwd(),
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 					}),
 				);
 				await this.finishSessionReplacement(options?.withSession);
+				status = "committed";
 				return { cancelled: false, selectedText };
 			}
 
-			if (!this.session.sessionManager.getStorage().exists(currentSessionFile)) {
-				throw new Error(
-					"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
-				);
-			}
-			const sessionManager = SessionManager.open(
-				currentSessionFile,
-				sessionDir,
-				undefined,
-				this.session.sessionManager.getStorage(),
-			);
-			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
-			if (!forkedSessionPath) {
-				throw new Error("Failed to create forked session");
-			}
+			const sessionManager = this.session.sessionManager;
 			await this.teardownCurrent("fork", sessionManager.getSessionFile());
+			if (!targetLeafId) {
+				sessionManager.newSession({ parentSession: previousSessionFile });
+			} else {
+				sessionManager.createBranchedSession(targetLeafId);
+			}
 			this.apply(
 				await this.createRuntime({
-					cwd: sessionManager.getCwd(),
+					cwd: this.cwd,
 					agentDir: this.services.agentDir,
 					sessionManager,
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
@@ -347,27 +442,13 @@ export class AgentSessionRuntime {
 			);
 			await this.finishSessionReplacement(options?.withSession);
 			return { cancelled: false, selectedText };
+		} catch (error) {
+			if (error instanceof ReplacementVetoError) return { cancelled: true };
+			throw error;
+		} finally {
+			if (destination) hooks?.onDestinationSettled?.({ ...destination, status });
 		}
-
-		const sessionManager = this.session.sessionManager;
-		await this.teardownCurrent("fork", sessionManager.getSessionFile());
-		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: previousSessionFile });
-		} else {
-			sessionManager.createBranchedSession(targetLeafId);
-		}
-		this.apply(
-			await this.createRuntime({
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-			}),
-		);
-		await this.finishSessionReplacement(options?.withSession);
-		return { cancelled: false, selectedText };
 	}
-
 	/**
 	 * Import a session JSONL file and switch runtime state to the imported session.
 	 *
@@ -375,7 +456,11 @@ export class AgentSessionRuntime {
 	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
-	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+	async importFromJsonl(
+		inputPath: string,
+		cwdOverride?: string,
+		replacementHooks?: ReplacementHooks,
+	): Promise<{ cancelled: boolean }> {
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -401,30 +486,59 @@ export class AgentSessionRuntime {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (!sourceAlreadyStored) {
-			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
+		let destination: ReplacementDestination | undefined;
+		let status: ReplacementOutcome["status"] = "aborted";
+		try {
+			if (replacementHooks) {
+				const header = parseSessionEntries(readFileSync(resolvedPath, "utf8"))[0];
+				if (header?.type !== "session" || typeof header.id !== "string") {
+					throw new Error(`Cannot import: source session has no header: ${resolvedPath}`);
+				}
+				destination = {
+					operation: "import",
+					sourcePath: resolvedPath,
+					destinationPath,
+					destinationId: header.id,
+					willWriteImmediately: !sourceAlreadyStored,
+				};
+				status = "uncertain";
+				if (replacementHooks.reserveDestination(destination) === false) {
+					status = "aborted";
+					return { cancelled: true };
+				}
+			}
+			status = "uncertain";
+			if (!sourceAlreadyStored) {
+				copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
+			}
+
+			const sessionManager = SessionManager.open(
+				destinationPath,
+				sessionDir,
+				cwdOverride,
+				this.session.sessionManager.getStorage(),
+			);
+			assertSessionCwdExists(sessionManager, this.cwd);
+			if (destination && sessionManager.getSessionId() !== destination.destinationId) {
+				throw new Error(`Imported session ID changed during copy: ${destinationPath}`);
+			}
+			await this.teardownCurrent("resume", sessionManager.getSessionFile());
+			if (destination) replacementHooks?.onSourceTeardown?.(destination);
+			this.apply(
+				await this.createRuntime({
+					cwd: sessionManager.getCwd(),
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				}),
+			);
+			await this.finishSessionReplacement();
+			status = "committed";
+			return { cancelled: false };
+		} finally {
+			if (destination) replacementHooks?.onDestinationSettled?.({ ...destination, status });
 		}
-
-		const sessionManager = SessionManager.open(
-			destinationPath,
-			sessionDir,
-			cwdOverride,
-			this.session.sessionManager.getStorage(),
-		);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-			}),
-		);
-		await this.finishSessionReplacement();
-		return { cancelled: false };
 	}
-
 	async dispose(): Promise<void> {
 		await this.session.abort();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {

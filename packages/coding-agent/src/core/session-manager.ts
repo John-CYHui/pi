@@ -27,6 +27,13 @@ export interface SessionHeader {
 	parentSession?: string;
 }
 
+/** Destination selected for a branched session, before manager state changes or a file is written. */
+export interface BranchedSessionDestination {
+	path: string;
+	id: string;
+	willWriteImmediately: boolean;
+}
+
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
@@ -1465,7 +1472,10 @@ export class SessionManager {
 	 * Useful for extracting a single conversation path from a branched session.
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(
+		leafId: string,
+		beforeCreate?: (destination: BranchedSessionDestination) => void,
+	): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1524,6 +1534,12 @@ export class SessionManager {
 		}
 
 		if (this.persist) {
+			// Invoke before mutation: a rejected reservation must leave the source intact.
+			beforeCreate?.({
+				path: newSessionFile,
+				id: newSessionId,
+				willWriteImmediately: pathWithoutLabels.some((e) => e.type === "message" && e.message.role === "assistant"),
+			});
 			// Build label entries
 			const lastEntryId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
 			let parentId = lastEntryId;

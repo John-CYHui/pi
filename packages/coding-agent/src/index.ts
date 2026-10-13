@@ -237,8 +237,12 @@ export {
 	createReadTool,
 	createWriteTool,
 	type PromptTemplate,
+	type ReplacementDestination,
+	type ReplacementHooks,
+	type ReplacementOutcome,
 } from "./core/sdk.ts";
 export {
+	type BranchedSessionDestination,
 	type BranchSummaryEntry,
 	buildContextEntries,
 	buildSessionContext,

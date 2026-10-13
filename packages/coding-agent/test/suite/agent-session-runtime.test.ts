@@ -16,6 +16,9 @@ import type {
 	AgentToolResult,
 	ExtensionAPI,
 	ExtensionFactory,
+	ReplacementDestination,
+	ReplacementHooks,
+	ReplacementOutcome,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,
 	SessionShutdownEvent,
@@ -121,6 +124,215 @@ describe("AgentSessionRuntime characterization", () => {
 
 		return { runtime, faux, tempDir };
 	}
+
+	it("reserves a persisted immediate-write fork before creating its file and acknowledges teardown and commit", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		const source = runtime.session;
+		const sourcePath = source.sessionFile!;
+		const originalContent = readFileSync(sourcePath, "utf8");
+		const events: string[] = [];
+		let proposed: ReplacementDestination | undefined;
+		const hooks: ReplacementHooks = {
+			reserveDestination(destination) {
+				proposed = destination;
+				expect(destination.sourcePath).toBe(sourcePath);
+				expect(destination.willWriteImmediately).toBe(true);
+				expect(existsSync(destination.destinationPath)).toBe(false);
+				expect(runtime.session).toBe(source);
+				events.push("reserved");
+			},
+			onSourceTeardown(destination) {
+				expect(destination).toBe(proposed);
+				expect(runtime.session).toBe(source);
+				events.push("teardown");
+			},
+			onDestinationSettled(outcome) {
+				expect(outcome.status).toBe("committed");
+				expect(runtime.session.sessionId).toBe(outcome.destinationId);
+				events.push("committed");
+			},
+		};
+		const leafId = source.sessionManager.getLeafId()!;
+		expect(await runtime.fork(leafId, { position: "at", replacementHooks: hooks })).toEqual({
+			cancelled: false,
+			selectedText: undefined,
+		});
+		expect(events).toEqual(["reserved", "teardown", "committed"]);
+		expect(proposed?.destinationPath).toBe(runtime.session.sessionFile);
+		expect(existsSync(runtime.session.sessionFile!)).toBe(true);
+		expect(readFileSync(sourcePath, "utf8")).toBe(originalContent);
+	});
+
+	it("vetoes a persisted immediate-write fork without changing the source or writing a destination", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		const source = runtime.session;
+		const sourcePath = source.sessionFile!;
+		const content = readFileSync(sourcePath, "utf8");
+		let proposedPath = "";
+		const outcomes: ReplacementOutcome[] = [];
+		const result = await runtime.fork(source.sessionManager.getLeafId()!, {
+			position: "at",
+			replacementHooks: {
+				reserveDestination(destination) {
+					proposedPath = destination.destinationPath;
+					expect(destination.willWriteImmediately).toBe(true);
+					return false;
+				},
+				onSourceTeardown() {
+					throw new Error("must not teardown");
+				},
+				onDestinationSettled(outcome) {
+					outcomes.push(outcome);
+				},
+			},
+		});
+		expect(result.cancelled).toBe(true);
+		expect(runtime.session).toBe(source);
+		expect(readFileSync(sourcePath, "utf8")).toBe(content);
+		expect(existsSync(proposedPath)).toBe(false);
+		expect(outcomes.map((outcome) => outcome.status)).toEqual(["aborted"]);
+	});
+
+	it("reserves root and lazy forks without writing a destination early", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		const firstUserId = runtime.session.getUserMessagesForForking()[0]!.entryId;
+		for (const position of ["at", "before"] as const) {
+			if (position === "before") await runtime.session.prompt("hello again");
+			const destinations: ReplacementDestination[] = [];
+			const result = await runtime.fork(firstUserId, {
+				position,
+				replacementHooks: {
+					reserveDestination(destination) {
+						destinations.push(destination);
+						expect(existsSync(destination.destinationPath)).toBe(false);
+					},
+					onSourceTeardown() {},
+					onDestinationSettled(outcome) {
+						expect(outcome.status).toBe("committed");
+					},
+				},
+			});
+			expect(result.cancelled).toBe(false);
+			expect(destinations).toHaveLength(1);
+			expect(destinations[0].willWriteImmediately).toBe(false);
+			expect(destinations[0].destinationId).toBe(runtime.session.sessionId);
+			expect(existsSync(destinations[0].destinationPath)).toBe(false);
+			await runtime.session.bindExtensions({});
+		}
+	});
+
+	it("acknowledges an uncertain fork when replacement binding fails", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		const events: string[] = [];
+		runtime.setRebindSession(async () => {
+			throw new Error("binding failed");
+		});
+		await expect(
+			runtime.fork(runtime.session.sessionManager.getLeafId()!, {
+				position: "at",
+				replacementHooks: {
+					reserveDestination() {
+						events.push("reserved");
+					},
+					onSourceTeardown() {
+						events.push("teardown");
+					},
+					onDestinationSettled(outcome) {
+						events.push(outcome.status);
+					},
+				},
+			}),
+		).rejects.toThrow("binding failed");
+		expect(events).toEqual(["reserved", "teardown", "uncertain"]);
+	});
+
+	it("vetoes an import before copying its source and acknowledges cancellation", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importPath = join(tempDir, "incoming.jsonl");
+		writeFileSync(
+			importPath,
+			`${JSON.stringify({ type: "session", version: 3, id: "incoming-id", timestamp: new Date().toISOString(), cwd: tempDir })}\n`,
+		);
+		const source = runtime.session;
+		const outcomes: ReplacementOutcome[] = [];
+		let destinationPath = "";
+		const result = await runtime.importFromJsonl(importPath, undefined, {
+			reserveDestination(destination) {
+				destinationPath = destination.destinationPath;
+				expect(destination.destinationId).toBe("incoming-id");
+				expect(destination.operation).toBe("import");
+				expect(existsSync(destinationPath)).toBe(false);
+				return false;
+			},
+			onSourceTeardown() {
+				throw new Error("must not teardown");
+			},
+			onDestinationSettled(outcome) {
+				outcomes.push(outcome);
+			},
+		});
+		expect(result.cancelled).toBe(true);
+		expect(runtime.session).toBe(source);
+		expect(existsSync(destinationPath)).toBe(false);
+		expect(outcomes.map((outcome) => outcome.status)).toEqual(["aborted"]);
+	});
+
+	it("acknowledges import teardown and commit after copying to the reserved path", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importPath = join(tempDir, "incoming-success.jsonl");
+		const content = `${JSON.stringify({ type: "session", version: 3, id: "import-success", timestamp: new Date().toISOString(), cwd: tempDir })}\n`;
+		writeFileSync(importPath, content);
+		const events: string[] = [];
+		const result = await runtime.importFromJsonl(importPath, undefined, {
+			reserveDestination(destination) {
+				expect(destination.destinationId).toBe("import-success");
+				expect(existsSync(destination.destinationPath)).toBe(false);
+				events.push("reserved");
+			},
+			onSourceTeardown(destination) {
+				expect(readFileSync(destination.destinationPath, "utf8")).toBe(content);
+				events.push("teardown");
+			},
+			onDestinationSettled(outcome) {
+				expect(outcome.status).toBe("committed");
+				expect(runtime.session.sessionFile).toBe(outcome.destinationPath);
+				events.push("committed");
+			},
+		});
+		expect(result.cancelled).toBe(false);
+		expect(events).toEqual(["reserved", "teardown", "committed"]);
+	});
+
+	it("acknowledges an uncertain import if replacement fails after copying", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importPath = join(tempDir, "incoming-failure.jsonl");
+		writeFileSync(
+			importPath,
+			`${JSON.stringify({ type: "session", version: 3, id: "import-failure", timestamp: new Date().toISOString(), cwd: tempDir })}\n`,
+		);
+		const events: string[] = [];
+		runtime.setRebindSession(async () => {
+			throw new Error("binding failed");
+		});
+		await expect(
+			runtime.importFromJsonl(importPath, undefined, {
+				reserveDestination() {
+					events.push("reserved");
+				},
+				onSourceTeardown() {
+					events.push("teardown");
+				},
+				onDestinationSettled(outcome) {
+					events.push(outcome.status);
+				},
+			}),
+		).rejects.toThrow("binding failed");
+		expect(events).toEqual(["reserved", "teardown", "uncertain"]);
+	});
 
 	it("persists message_end assistant replacements to the session manager", async () => {
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {

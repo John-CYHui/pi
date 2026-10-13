@@ -570,6 +570,36 @@ describe("createBranchedSession", () => {
 		}
 	});
 
+	it("vetoes an immediate-write branch before changing the source or creating a destination", () => {
+		const tempDir = join(tmpdir(), `session-fork-veto-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, tempDir);
+			session.appendMessage(userMsg("question"));
+			const leafId = session.appendMessage(assistantMsg("answer"));
+			const sourcePath = session.getSessionFile()!;
+			const originalContent = readFileSync(sourcePath, "utf8");
+			const originalEntries = session.getEntries();
+			let proposedPath = "";
+			expect(() =>
+				session.createBranchedSession(leafId, (destination) => {
+					proposedPath = destination.path;
+					expect(destination.willWriteImmediately).toBe(true);
+					expect(existsSync(destination.path)).toBe(false);
+					throw new Error("reservation denied");
+				}),
+			).toThrow("reservation denied");
+			expect(proposedPath).not.toBe(sourcePath);
+			expect(existsSync(proposedPath)).toBe(false);
+			expect(readFileSync(sourcePath, "utf8")).toBe(originalContent);
+			expect(session.getSessionFile()).toBe(sourcePath);
+			expect(session.getEntries()).toEqual(originalEntries);
+			expect(session.getLeafId()).toBe(leafId);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("writes file immediately when forking from a point with assistant messages", () => {
 		const tempDir = join(tmpdir(), `session-fork-with-assistant-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
