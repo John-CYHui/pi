@@ -1,4 +1,6 @@
-// Core session management
+/**
+ * Public package entry point for session management, the SDK, tools, and extension APIs.
+ */
 
 export { type Args, parseArgs } from "./cli/args.ts";
 
@@ -251,6 +253,7 @@ export {
 	type CustomEntry,
 	type CustomMessageEntry,
 	type FileEntry,
+	getDefaultSessionDir,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,

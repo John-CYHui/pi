@@ -1,3 +1,6 @@
+/**
+ * Manage persisted conversation trees and discover session files in flat or per-project directories.
+ */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
@@ -477,6 +480,13 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 	return join(resolvedAgentDir, "sessions", safePath);
 }
 
+/**
+ * Return Pi's encoded per-project session directory under an explicit agent directory.
+ * Creates the directory if missing, as the default session manager does.
+ * @param cwd Project working directory to encode.
+ * @param agentDir Agent configuration directory; defaults to the configured Pi agent directory.
+ * @returns Absolute path to the project's session directory.
+ */
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const sessionDir = getDefaultSessionDirPath(cwd, agentDir);
 	if (!existsSync(sessionDir)) {
@@ -847,6 +857,62 @@ async function listSessionsFromDir(
 	}
 
 	return sessions;
+}
+
+/**
+ * Discover sessions in each project directory beneath an explicit sessions root.
+ * Symlinked directories retain their alias paths, matching listAll's existing behavior.
+ * @param sessionsDir Parent of the encoded project directories.
+ * @param onProgress Callback tracking files processed across all project directories.
+ * @returns Sessions sorted by most recent activity, or an empty list if the root is inaccessible.
+ */
+async function listSessionsAcrossProjects(
+	sessionsDir: string,
+	onProgress?: SessionListProgress,
+): Promise<SessionInfo[]> {
+	try {
+		if (!existsSync(sessionsDir)) {
+			return [];
+		}
+		const entries = await readdir(sessionsDir, { withFileTypes: true });
+		const dirs = entries
+			.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+			.map((entry) => join(sessionsDir, entry.name));
+
+		// Count total files first for accurate progress
+		let totalFiles = 0;
+		const dirFiles: string[][] = [];
+		for (const dir of dirs) {
+			try {
+				const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
+				dirFiles.push(files.map((f) => join(dir, f)));
+				totalFiles += files.length;
+			} catch {
+				dirFiles.push([]);
+			}
+		}
+
+		// Process all files with progress tracking
+		let loaded = 0;
+		const sessions: SessionInfo[] = [];
+		const allFiles = dirFiles.flat();
+
+		const results = await buildSessionInfosWithConcurrency(allFiles, () => {
+			loaded++;
+			onProgress?.(loaded, totalFiles);
+		});
+
+		for (const info of results) {
+			if (info) {
+				sessions.push(info);
+			}
+		}
+
+		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+		return sessions;
+	} catch {
+		return [];
+	}
 }
 
 /**
@@ -1783,48 +1849,17 @@ export class SessionManager {
 			return sessions;
 		}
 
-		try {
-			if (!existsSync(sessionsDir)) {
-				return [];
-			}
-			const entries = await readdir(sessionsDir, { withFileTypes: true });
-			const dirs = entries
-				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-				.map((entry) => join(sessionsDir, entry.name));
+		return listSessionsAcrossProjects(sessionsDir, progress);
+	}
 
-			// Count total files first for accurate progress
-			let totalFiles = 0;
-			const dirFiles: string[][] = [];
-			for (const dir of dirs) {
-				try {
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-					dirFiles.push(files.map((f) => join(dir, f)));
-					totalFiles += files.length;
-				} catch {
-					dirFiles.push([]);
-				}
-			}
-
-			// Process all files with progress tracking
-			let loaded = 0;
-			const sessions: SessionInfo[] = [];
-			const allFiles = dirFiles.flat();
-
-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
-				loaded++;
-				progress?.(loaded, totalFiles);
-			});
-
-			for (const info of results) {
-				if (info) {
-					sessions.push(info);
-				}
-			}
-
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
-		} catch {
-			return [];
-		}
+	/**
+	 * List sessions across encoded project directories beneath an explicitly prepared agent directory.
+	 * Unlike listAll(sessionDir), this enumerates project subdirectories instead of a flat override.
+	 * @param agentDir Agent configuration directory containing a sessions/ directory.
+	 * @param onProgress Callback tracking files processed across all project directories.
+	 * @returns Sessions sorted by most recent activity; does not create directories.
+	 */
+	static async listAllInAgentDir(agentDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		return listSessionsAcrossProjects(join(resolvePath(agentDir), "sessions"), onProgress);
 	}
 }
