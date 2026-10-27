@@ -700,6 +700,7 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message,
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -779,6 +780,7 @@ export class AgentSession {
 			return;
 		}
 
+		// SAFETY: AgentMessage variants are plain mutable objects; replacement preserves the message identity.
 		const targetRecord = target as unknown as Record<string, unknown>;
 		for (const key of Object.keys(targetRecord)) {
 			delete targetRecord[key];
@@ -1649,6 +1651,7 @@ export class AgentSession {
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
+			appMessage,
 		);
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });

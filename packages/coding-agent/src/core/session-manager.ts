@@ -196,6 +196,7 @@ export type ReadonlySessionManager = Pick<
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
+	| "getMessageEntryId"
 	| "getLabel"
 	| "getBranch"
 	| "buildContextEntries"
@@ -935,9 +936,14 @@ export class SessionManager {
 	private readonly storage: SessionStorage;
 	private writer: SessionStorageWriter | undefined;
 	private pendingWrites: Promise<void> = Promise.resolve();
+	private pendingMessageWrites = new Set<string>();
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
+	/** Object identity only: neither content nor timestamp identifies a persisted message. */
+	private messageEntryIds = new WeakMap<AgentMessage, string | null>();
+	private activeContextEntryIds: Set<string> | undefined;
+	private activeContextLeafId: string | null = null;
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
@@ -1015,6 +1021,9 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		this.fileEntries = [header];
+		this.messageEntryIds = new WeakMap();
+		this.activeContextEntryIds = undefined;
+		this.pendingMessageWrites.clear();
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1047,6 +1056,9 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.messageEntryIds = new WeakMap();
+		this.activeContextEntryIds = undefined;
+		this.pendingMessageWrites.clear();
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1055,6 +1067,7 @@ export class SessionManager {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
+			if (entry.type === "message") this._registerMessageEntry(entry.message, entry.id);
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1102,13 +1115,18 @@ export class SessionManager {
 		return this.writer;
 	}
 
-	private _appendSync(line: string): void {
+	private _appendSync(line: string, entryId: string): void {
 		const writer = this._getWriter();
 		if (writer.appendSync) {
 			writer.appendSync(line);
 			return;
 		}
-		this.pendingWrites = this.pendingWrites.then(() => writer.append(line));
+		this.pendingMessageWrites.add(entryId);
+		this.pendingWrites = this.pendingWrites
+			.then(() => writer.append(line))
+			.then(() => {
+				this.pendingMessageWrites.delete(entryId);
+			});
 	}
 
 	isPersisted(): boolean {
@@ -1145,7 +1163,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				this._appendSync(`${JSON.stringify(entry)}\n`);
+				this._appendSync(`${JSON.stringify(entry)}\n`, entry.id);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1157,8 +1175,29 @@ export class SessionManager {
 			this.storage.write(this.sessionFile, this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join(""));
 			this.flushed = true;
 		} else {
-			this._appendSync(`${JSON.stringify(entry)}\n`);
+			this._appendSync(`${JSON.stringify(entry)}\n`, entry.id);
 		}
+	}
+
+	private _registerMessageEntry(message: AgentMessage, entryId: string): void {
+		const previous = this.messageEntryIds.get(message);
+		// Reusing one object for two entries is ambiguous, even after a branch switch.
+		if (previous === undefined) this.messageEntryIds.set(message, entryId);
+		else if (previous !== entryId) this.messageEntryIds.set(message, null);
+	}
+
+	/**
+	 * Return the entry ID only for this exact message object when it belongs to the
+	 * current compaction-aware branch. Ambiguous and context-only messages return undefined.
+	 */
+	getMessageEntryId(message: AgentMessage): string | undefined {
+		const id = this.messageEntryIds.get(message);
+		if (!id || (this.persist && !this.flushed) || this.pendingMessageWrites.has(id)) return undefined;
+		if (!this.activeContextEntryIds || this.activeContextLeafId !== this.leafId) {
+			this.activeContextEntryIds = new Set(this.buildContextEntries().map((entry) => entry.id));
+			this.activeContextLeafId = this.leafId;
+		}
+		return this.activeContextEntryIds.has(id) ? id : undefined;
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
@@ -1191,6 +1230,7 @@ export class SessionManager {
 			message,
 		};
 		this._appendEntry(entry);
+		this._registerMessageEntry(message, entry.id);
 		return entry.id;
 	}
 
@@ -1301,6 +1341,7 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		message?: CustomMessage<T>,
 	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -1313,6 +1354,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 		};
 		this._appendEntry(entry);
+		if (message) this._registerMessageEntry(message, entry.id);
 		return entry.id;
 	}
 
@@ -1410,7 +1452,13 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		const { thinkingLevel, model } = getSessionContextSettings(this.getBranch());
+		const messages = this.buildContextEntries().flatMap((entry) => {
+			const projected = sessionEntryToContextMessages(entry);
+			for (const message of projected) this._registerMessageEntry(message, entry.id);
+			return projected;
+		});
+		return { messages, thinkingLevel, model };
 	}
 
 	/**
