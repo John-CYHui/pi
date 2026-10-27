@@ -750,6 +750,15 @@ export const theme: Theme = new Proxy({} as Theme, {
 	},
 });
 
+let headlessTheme: Theme | undefined;
+
+/** Provide a theme to headless extensions without initializing the interactive global theme. */
+export function getHeadlessTheme(): Theme {
+	if ((globalThis as Record<symbol, Theme>)[THEME_KEY]) return theme;
+	if (!headlessTheme) headlessTheme = loadTheme(getDefaultTheme());
+	return headlessTheme;
+}
+
 function setGlobalTheme(t: Theme): void {
 	(globalThis as Record<symbol, Theme>)[THEME_KEY] = t;
 	(globalThis as Record<symbol, Theme>)[THEME_KEY_OLD] = t;

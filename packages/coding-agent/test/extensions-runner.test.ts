@@ -20,6 +20,7 @@ import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ScopedModel } from "../src/core/model-resolver.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { getThemeByName, theme } from "../src/modes/interactive/theme/theme.ts";
 
 describe("ExtensionRunner", () => {
 	let tempDir: string;
@@ -527,6 +528,51 @@ describe("ExtensionRunner", () => {
 			const ctx = runner.createContext();
 			expect(ctx.mode).toBe("print");
 			expect(ctx.hasUI).toBe(false);
+		});
+
+		it("styles extension status during a headless turn without initializing the interactive theme", async () => {
+			const key = Symbol.for("@earendil-works/pi-coding-agent:theme");
+			const previousTheme = Reflect.get(globalThis, key);
+			Reflect.deleteProperty(globalThis, key);
+			try {
+				fs.writeFileSync(
+					path.join(extensionsDir, "status.ts"),
+					`export default function(pi) {
+	pi.on("agent_start", (_event, ctx) => {
+		ctx.ui.setStatus("mcp", ctx.ui.theme.fg("muted", "Connected"));
+	});
+}`,
+				);
+				const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+				expect(result.errors).toEqual([]);
+				expect(result.extensions).toHaveLength(1);
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir,
+					sessionManager,
+					modelRegistry,
+				);
+				const errors: string[] = [];
+				runner.onError((error) => errors.push(error.error));
+				const ctx = runner.createContext();
+
+				expect(ctx.hasUI).toBe(false);
+				expect(ctx.ui.theme.fg("muted", "Connected")).toContain("Connected");
+				await runner.emit({ type: "agent_start" });
+				expect(errors).toEqual([]);
+				expect(Reflect.has(globalThis, key)).toBe(false);
+				expect(() => theme.fg("muted", "Connected")).toThrow("Theme not initialized");
+
+				const interactiveTheme = getThemeByName("light");
+				expect(interactiveTheme).toBeDefined();
+				Reflect.set(globalThis, key, interactiveTheme);
+				expect(ctx.ui.theme).toBe(theme);
+				expect(ctx.ui.theme.fg("muted", "Connected")).toBe(interactiveTheme?.fg("muted", "Connected"));
+			} finally {
+				if (previousTheme === undefined) Reflect.deleteProperty(globalThis, key);
+				else Reflect.set(globalThis, key, previousTheme);
+			}
 		});
 
 		it("exposes project trust state on ExtensionContext", async () => {
