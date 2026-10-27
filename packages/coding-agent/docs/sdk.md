@@ -608,6 +608,8 @@ Custom tools passed via `customTools` are combined with extension-registered too
 
 If you pass `tools`, include each custom or extension tool name you want enabled, for example `tools: ["read", "bash", "my_tool"]`.
 
+For session-local tools that must be replaced or removed after creation, use `session.replaceCustomToolsScope(scopeId: string, definitions: readonly ToolDefinition[]): void`. Replacing a scope updates existing definitions, activates new names (subject to the session tool allowlist/denylist), retains the active state of unchanged names, and unregisters omitted names. Passing `[]` removes the scope. The call is synchronous and rejects while the session is busy or disposed, or if a name collides with a built-in, an initial SDK tool, an extension tool, another scope, or a duplicate in the replacement list. Unlike `pi.registerTool()`, this is a session-owned SDK method; it does not change extension registrations or persist definitions when a session is restored. Use `session.getToolDefinition(name)` and `session.getActiveToolNames()` to inspect the result.
+
 > See [examples/sdk/05-tools.ts](../examples/sdk/05-tools.ts)
 
 ### Extensions

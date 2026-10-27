@@ -110,7 +110,7 @@ import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
-import { createAllToolDefinitions } from "./tools/index.ts";
+import { allToolNames, createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
@@ -372,6 +372,7 @@ export class AgentSession {
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
+	private _customToolScopes = new Map<string, readonly ToolDefinition[]>();
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
@@ -1001,6 +1002,78 @@ export class AgentSession {
 
 	getToolDefinition(name: string): ToolDefinition | undefined {
 		return this._toolDefinitions.get(name)?.definition;
+	}
+
+	/**
+	 * Atomically replace one session-local custom-tool scope. An empty list removes the scope.
+	 * Names already owned by built-in, initial SDK, extension, or other scoped tools are rejected.
+	 * Existing active names are retained; newly registered names become active when allowed.
+	 * Call only while the session is idle. Scope changes are not persisted in the transcript.
+	 */
+	replaceCustomToolsScope(scopeId: string, definitions: readonly ToolDefinition[]): void {
+		if (
+			this._disposed ||
+			!this.isIdle ||
+			this._sessionMutationAdmissions > 0 ||
+			this._toolAdmissionReservations > 0 ||
+			this.isBashRunning ||
+			this.isCommandRunning
+		) {
+			throw new Error("Cannot replace custom tools while the session is busy or disposed.");
+		}
+		if (!scopeId.trim()) {
+			throw new Error("Custom tool scope ID must not be empty.");
+		}
+
+		const ownedNames = new Set(this._customToolScopes.get(scopeId)?.map((tool) => tool.name));
+		const occupiedNames = new Set([
+			...allToolNames,
+			...this._baseToolDefinitions.keys(),
+			...this._customTools.map((tool) => tool.name),
+			...this._extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name),
+			...Array.from(this._customToolScopes.entries())
+				.filter(([id]) => id !== scopeId)
+				.flatMap(([, tools]) => tools.map((tool) => tool.name)),
+		]);
+		const nextNames = new Set<string>();
+		for (const definition of definitions) {
+			if (!definition.name || occupiedNames.has(definition.name) || nextNames.has(definition.name)) {
+				throw new Error(`Custom tool name conflicts with an existing tool: ${definition.name}`);
+			}
+			nextNames.add(definition.name);
+		}
+
+		const previousActiveNames = this.getActiveToolNames();
+		const nextActiveNames = previousActiveNames.filter((name) => !ownedNames.has(name) || nextNames.has(name));
+		for (const name of nextNames) {
+			if (!ownedNames.has(name)) nextActiveNames.push(name);
+		}
+		const previousDefinitions = this._customToolScopes.get(scopeId);
+		const previousRegistry = this._toolRegistry;
+		const previousDefinitionRegistry = this._toolDefinitions;
+		const previousSnippets = this._toolPromptSnippets;
+		const previousGuidelines = this._toolPromptGuidelines;
+		const previousTools = this.agent.state.tools;
+		const previousPrompt = this.agent.state.systemPrompt;
+		const previousBasePrompt = this._baseSystemPrompt;
+		const previousPromptOptions = this._baseSystemPromptOptions;
+		if (definitions.length === 0) this._customToolScopes.delete(scopeId);
+		else this._customToolScopes.set(scopeId, [...definitions]);
+		try {
+			this._refreshToolRegistry({ activeToolNames: nextActiveNames, preserveActiveToolNames: true });
+		} catch (error) {
+			if (previousDefinitions) this._customToolScopes.set(scopeId, previousDefinitions);
+			else this._customToolScopes.delete(scopeId);
+			this._toolRegistry = previousRegistry;
+			this._toolDefinitions = previousDefinitionRegistry;
+			this._toolPromptSnippets = previousSnippets;
+			this._toolPromptGuidelines = previousGuidelines;
+			this.agent.state.tools = previousTools;
+			this.agent.state.systemPrompt = previousPrompt;
+			this._baseSystemPrompt = previousBasePrompt;
+			this._baseSystemPromptOptions = previousPromptOptions;
+			throw error;
+		}
 	}
 
 	/**
@@ -2838,7 +2911,11 @@ export class AgentSession {
 		);
 	}
 
-	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
+	private _refreshToolRegistry(options?: {
+		activeToolNames?: string[];
+		includeAllExtensionTools?: boolean;
+		preserveActiveToolNames?: boolean;
+	}): void {
 		const previousRegistryNames = new Set(this._toolRegistry.keys());
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedToolNames = this._allowedToolNames;
@@ -2853,6 +2930,12 @@ export class AgentSession {
 				definition,
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
+			...Array.from(this._customToolScopes.entries()).flatMap(([scopeId, definitions]) =>
+				definitions.map((definition) => ({
+					definition,
+					sourceInfo: createSyntheticSourceInfo(`<sdk:${scopeId}:${definition.name}>`, { source: "sdk" }),
+				})),
+			),
 		].filter((tool) => isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
@@ -2910,7 +2993,7 @@ export class AgentSession {
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
 		).filter((name) => isAllowedTool(name));
 
-		if (allowedToolNames) {
+		if (allowedToolNames && !options?.preserveActiveToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
 				if (allowedToolNames.has(toolName)) {
 					nextActiveToolNames.push(toolName);
