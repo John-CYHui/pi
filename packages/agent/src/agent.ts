@@ -125,7 +125,7 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private groups: AgentMessage[][] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -133,30 +133,31 @@ class PendingMessageQueue {
 	}
 
 	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+		this.enqueueGroup([message]);
+	}
+
+	enqueueGroup(messages: readonly AgentMessage[]): void {
+		if (messages.length > 0) {
+			this.groups.push([...messages]);
+		}
 	}
 
 	hasItems(): boolean {
-		return this.messages.length > 0;
+		return this.groups.length > 0;
 	}
 
 	drain(): AgentMessage[] {
 		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
+			const drained = this.groups.flat();
+			this.groups = [];
 			return drained;
 		}
 
-		const first = this.messages[0];
-		if (!first) {
-			return [];
-		}
-		this.messages = this.messages.slice(1);
-		return [first];
+		return this.groups.shift() ?? [];
 	}
 
 	clear(): void {
-		this.messages = [];
+		this.groups = [];
 	}
 }
 
@@ -286,9 +287,19 @@ export class Agent {
 		this.steeringQueue.enqueue(message);
 	}
 
+	/** Queue a prompt batch to be injected together after the current assistant turn. */
+	steerGroup(messages: readonly AgentMessage[]): void {
+		this.steeringQueue.enqueueGroup(messages);
+	}
+
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(message: AgentMessage): void {
 		this.followUpQueue.enqueue(message);
+	}
+
+	/** Queue a prompt batch to run together after the agent would otherwise stop. */
+	followUpGroup(messages: readonly AgentMessage[]): void {
+		this.followUpQueue.enqueueGroup(messages);
 	}
 
 	/** Remove all queued steering messages. */

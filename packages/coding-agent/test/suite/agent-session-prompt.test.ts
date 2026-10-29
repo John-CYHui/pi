@@ -40,6 +40,126 @@ describe("AgentSession prompt characterization", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("delivers attached custom messages in the same fresh prompt batch after preflight", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", () => ({ action: "transform", text: "transformed" }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const seen: string[][] = [];
+		harness.setResponses([
+			(context) => {
+				seen.push(context.messages.map(getMessageText));
+				return fauxAssistantMessage("ok");
+			},
+		]);
+
+		await harness.session.prompt("original", {
+			attachedMessages: [
+				{ customType: "first", content: "aside one", display: false, details: { id: 1 } },
+				{ customType: "second", content: "aside two", display: true },
+			],
+		});
+
+		expect(seen).toEqual([["transformed", "aside one", "aside two"]]);
+		expect(harness.session.messages.map((message) => message.role)).toEqual([
+			"user",
+			"custom",
+			"custom",
+			"assistant",
+		]);
+		expect(harness.session.messages[1]).toMatchObject({
+			customType: "first",
+			content: "aside one",
+			display: false,
+			details: { id: 1 },
+		});
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(2);
+		harness.setResponses([fauxAssistantMessage("next response")]);
+		await harness.session.prompt("next", { attachedMessages: [] });
+		expect(harness.session.messages.filter((message) => message.role === "custom")).toHaveLength(2);
+	});
+
+	it("captures attached content before asynchronous input interception", async () => {
+		let releaseInput!: () => void;
+		let enteredInput!: () => void;
+		const inputGate = new Promise<void>((resolve) => {
+			releaseInput = resolve;
+		});
+		const inputEntered = new Promise<void>((resolve) => {
+			enteredInput = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async () => {
+						enteredInput();
+						await inputGate;
+						return { action: "continue" };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const seen: string[][] = [];
+		harness.setResponses([
+			(context) => {
+				seen.push(context.messages.map(getMessageText));
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		const content = [{ type: "text" as const, text: "original aside" }];
+		const attachedMessages = [{ customType: "file", content, display: true }];
+		const pending = harness.session.prompt("user", { attachedMessages });
+		await inputEntered;
+		content[0].text = "mutated aside";
+		attachedMessages[0].customType = "mutated";
+		releaseInput();
+		await pending;
+		expect(seen).toEqual([["user", "original aside"]]);
+		expect(harness.session.messages[1]).toMatchObject({ customType: "file", content: [{ text: "original aside" }] });
+	});
+
+	it("does not persist attachments for handled commands or inputs", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("handled", { handler: async () => {} });
+					pi.on("input", () => ({ action: "handled" }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const attachedMessages = [{ customType: "unused", content: "not sent", display: true }];
+		await harness.session.prompt("/handled", { attachedMessages });
+		await harness.session.prompt("input handled", { attachedMessages });
+		expect(harness.session.messages).toEqual([]);
+		expect(harness.sessionManager.getEntries()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("does not leak rejected prompt attachments to a later prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.agent.state.model = undefined as unknown as Model<any>;
+		await expect(
+			harness.session.prompt("rejected", {
+				attachedMessages: [{ customType: "rejected", content: "do not send", display: true }],
+			}),
+		).rejects.toThrow("No model selected");
+		expect(harness.session.messages).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.sessionManager.getEntries()).toEqual([]);
+		harness.session.agent.state.model = harness.getModel();
+		harness.setResponses([fauxAssistantMessage("ok")]);
+		// The rejected aside must not become a global next-turn message.
+		await harness.session.prompt("accepted");
+		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+	});
+
 	it("handles a tool call turn and waits for the follow-up LLM response", async () => {
 		const toolRuns: string[] = [];
 		const echoTool: AgentTool = {

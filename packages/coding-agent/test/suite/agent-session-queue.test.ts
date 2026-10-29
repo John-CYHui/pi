@@ -155,6 +155,130 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toContain("follow-up response");
 	});
 
+	it.each(["steer", "followUp"] as const)(
+		"keeps attached %s messages atomic in one-at-a-time mode and persists each once",
+		async (streamingBehavior) => {
+			const waiting = await createWaitingHarness();
+			const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+			harnesses.push(harness);
+			const requests: string[][] = [];
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				...(streamingBehavior === "followUp" ? [fauxAssistantMessage("initial done")] : []),
+				(context) => {
+					requests.push(context.messages.map(getMessageText));
+					return fauxAssistantMessage("attached done");
+				},
+				(context) => {
+					requests.push(context.messages.map(getMessageText));
+					return fauxAssistantMessage("next done");
+				},
+			]);
+
+			await waitForToolStart;
+			await harness.session.prompt("attached user", {
+				streamingBehavior,
+				attachedMessages: [
+					{ customType: "one", content: "aside 1", display: false, details: { index: 1 } },
+					{ customType: "two", content: "aside 2", display: true },
+				],
+			});
+			await harness.session.prompt("next user", { streamingBehavior });
+			releaseToolExecution();
+			await promptPromise;
+
+			expect(requests).toHaveLength(2);
+			const attachedUserIndex = requests[0]!.indexOf("attached user");
+			expect(attachedUserIndex).toBeGreaterThanOrEqual(0);
+			expect(requests[0]!.slice(attachedUserIndex, attachedUserIndex + 3)).toEqual([
+				"attached user",
+				"aside 1",
+				"aside 2",
+			]);
+			expect(requests[0]).not.toContain("next user");
+			expect(requests[1]).toContain("next user");
+			expect(harness.session.messages.filter((message) => message.role === "custom")).toHaveLength(2);
+			expect(harness.session.messages.filter((message) => message.role === "custom").map(getMessageText)).toEqual([
+				"aside 1",
+				"aside 2",
+			]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(2);
+			expect(harness.session.pendingMessageCount).toBe(0);
+		},
+	);
+
+	it.each(["steer", "followUp"] as const)(
+		"clearQueue discards the entire attached %s group",
+		async (streamingBehavior) => {
+			const waiting = await createWaitingHarness();
+			const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			await waitForToolStart;
+			await harness.session.prompt("discard", {
+				streamingBehavior,
+				attachedMessages: [{ customType: "discard", content: "unseen", display: true }],
+			});
+			expect(harness.session.clearQueue()[streamingBehavior === "steer" ? "steering" : "followUp"]).toEqual([
+				"discard",
+			]);
+			releaseToolExecution();
+			await promptPromise;
+			expect(getUserTexts(harness)).toEqual(["start"]);
+			expect(harness.session.messages.filter((message) => message.role === "custom")).toEqual([]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toEqual([]);
+		},
+	);
+
+	it("does not queue attached messages for handled streaming input", async () => {
+		const waiting = await createWaitingHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => (event.text === "handled" ? { action: "handled" } : { action: "continue" }));
+				},
+			],
+		});
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("handled", {
+			streamingBehavior: "steer",
+			attachedMessages: [{ customType: "handled", content: "unseen", display: true }],
+		});
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		releaseToolExecution();
+		await promptPromise;
+		expect(harness.session.messages.filter((message) => message.role === "custom")).toEqual([]);
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
+	it("rejects attached streaming prompts without a behavior without queuing or persisting", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await expect(
+			harness.session.prompt("rejected", {
+				attachedMessages: [{ customType: "rejected", content: "unseen", display: true }],
+			}),
+		).rejects.toThrow("Specify streamingBehavior");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		releaseToolExecution();
+		await promptPromise;
+		expect(harness.session.messages.filter((message) => message.role === "custom")).toEqual([]);
+	});
+
 	it("delivers multiple steering messages in order in one-at-a-time mode", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;

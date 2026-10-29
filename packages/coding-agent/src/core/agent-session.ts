@@ -256,6 +256,8 @@ export interface PromptOptions {
 	expandPromptTemplates?: boolean;
 	/** Image attachments */
 	images?: ImageContent[];
+	/** Custom messages delivered atomically with this prompt, after interception and preflight. */
+	attachedMessages?: readonly Pick<CustomMessage, "customType" | "content" | "display" | "details">[];
 	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). Required if streaming. */
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
@@ -301,6 +303,19 @@ export interface SessionStats {
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
+}
+
+/** Copy prompt-attached asides before asynchronous preflight can observe caller mutations. */
+function createAttachedMessages(attachedMessages: PromptOptions["attachedMessages"]): CustomMessage[] {
+	return (attachedMessages ?? []).map((msg) => ({
+		role: "custom",
+		customType: msg.customType,
+		// Untyped callers may supply null/missing content; normalize at ingestion.
+		content: typeof msg.content === "string" ? msg.content : (msg.content?.map((part) => ({ ...part })) ?? []),
+		display: msg.display,
+		details: msg.details,
+		timestamp: Date.now(),
+	}));
 }
 
 function estimateMessagesTokens(messages: AgentMessage[]): number {
@@ -1282,6 +1297,9 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			// Snapshot before interception and auth await external code so the admitted
+			// aside content cannot change while preflight is suspended.
+			const attachedMessages = createAttachedMessages(options?.attachedMessages);
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -1334,9 +1352,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, attachedMessages);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, attachedMessages);
 				}
 				preflightResult?.(true);
 				return;
@@ -1422,6 +1440,10 @@ export class AgentSession {
 				// Ensure we're using the base prompt (in case previous turn had modifications)
 				this._systemPromptOverride = undefined;
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
+			}
+			// Attach only after all interception, auth, compaction, and extension preflight succeeds.
+			if (attachedMessages.length) {
+				messages.push(...attachedMessages);
 			}
 			// Reserve the model-run state before releasing asynchronous preflight
 			// admission so standalone tools cannot enter during the handoff.
@@ -1550,35 +1572,45 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		attachedMessages?: readonly CustomMessage[],
+	): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const userMessage = { role: "user" as const, content, timestamp: Date.now() };
+		if (attachedMessages?.length) {
+			this.agent.steerGroup([userMessage, ...attachedMessages]);
+		} else {
+			this.agent.steer(userMessage);
+		}
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		attachedMessages?: readonly CustomMessage[],
+	): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const userMessage = { role: "user" as const, content, timestamp: Date.now() };
+		if (attachedMessages?.length) {
+			this.agent.followUpGroup([userMessage, ...attachedMessages]);
+		} else {
+			this.agent.followUp(userMessage);
+		}
 	}
 
 	/**
