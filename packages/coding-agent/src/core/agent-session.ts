@@ -1758,6 +1758,19 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
+	/** Remove the first pending user prompt of this kind without disturbing any
+	 * surviving prompt's images/custom cards or unrelated queued custom entries.
+	 * Returns false if the group has already been drained for delivery. */
+	removeQueuedPrompt(kind: "steer" | "followUp", text: string): boolean {
+		this._assertAvailableForSessionMutation("remove a queued prompt");
+		const mirror = kind === "steer" ? this._steeringMessages : this._followUpMessages;
+		const index = mirror.indexOf(text);
+		if (index < 0 || !this.agent.removeQueuedUserGroup(kind, text)) return false;
+		mirror.splice(index, 1);
+		this._emitQueueUpdate();
+		return true;
+	}
+
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
 		return this._steeringMessages.length + this._followUpMessages.length;

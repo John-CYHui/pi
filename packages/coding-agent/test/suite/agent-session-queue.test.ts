@@ -207,6 +207,78 @@ describe("AgentSession queue characterization", () => {
 		},
 	);
 
+	// Regression for PWUI checklist #82: removing one pending group must not
+	// silently drop the images or custom cards attached to surviving prompts.
+	it.each(["steer", "followUp"] as const)(
+		"removes only the first pending %s prompt and retains surviving groups",
+		async (streamingBehavior) => {
+			const waiting = await createWaitingHarness();
+			const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				...(streamingBehavior === "followUp" ? [fauxAssistantMessage("initial done")] : []),
+				fauxAssistantMessage("duplicate delivered"),
+				fauxAssistantMessage("attachment delivered"),
+			]);
+			await waitForToolStart;
+			const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
+			await harness.session.prompt("duplicate", {
+				streamingBehavior,
+				attachedMessages: [{ customType: "removed", content: "removed-card", display: true }],
+			});
+			await harness.session.prompt("duplicate", { streamingBehavior });
+			await harness.session.prompt("survivor", {
+				streamingBehavior,
+				images: [image],
+				attachedMessages: [{ customType: "survivor", content: "survivor-card", display: true }],
+			});
+			const kind = streamingBehavior === "steer" ? "steering" : "followUp";
+			expect(harness.session.removeQueuedPrompt(streamingBehavior, "absent")).toBe(false);
+			expect(harness.session.removeQueuedPrompt(streamingBehavior, "duplicate")).toBe(true);
+			expect(harness.session.removeQueuedPrompt(streamingBehavior, "duplicate")).toBe(true);
+			expect(harness.session.removeQueuedPrompt(streamingBehavior, "duplicate")).toBe(false);
+			expect(harness.session.getSteeringMessages()).toEqual(kind === "steering" ? ["survivor"] : []);
+			expect(harness.session.getFollowUpMessages()).toEqual(kind === "followUp" ? ["survivor"] : []);
+			releaseToolExecution();
+			await promptPromise;
+			expect(getUserTexts(harness)).toEqual(["start", "survivor"]);
+			const survivor = harness.session.messages.find(
+				(message) => message.role === "user" && getMessageText(message) === "survivor",
+			);
+			expect(survivor?.role === "user" ? survivor.content[1] : undefined).toEqual(image);
+			expect(harness.session.messages.filter((message) => message.role === "custom").map(getMessageText)).toEqual([
+				"survivor-card",
+			]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(1);
+		},
+	);
+
+	it("keeps unrelated queued custom messages when removing a user follow-up", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("initial done"),
+			fauxAssistantMessage("custom delivered"),
+		]);
+		await waitForToolStart;
+		await harness.session.followUp("discard");
+		await harness.session.sendCustomMessage(
+			{ customType: "unrelated", content: "keep custom", display: true },
+			{ deliverAs: "followUp" },
+		);
+		expect(harness.session.removeQueuedPrompt("followUp", "discard")).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		releaseToolExecution();
+		await promptPromise;
+		expect(getUserTexts(harness)).toEqual(["start"]);
+		expect(harness.session.messages.filter((message) => message.role === "custom").map(getMessageText)).toEqual([
+			"keep custom",
+		]);
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"clearQueue discards the entire attached %s group",
 		async (streamingBehavior) => {

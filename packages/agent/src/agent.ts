@@ -156,6 +156,14 @@ class PendingMessageQueue {
 		return this.groups.shift() ?? [];
 	}
 
+	/** Remove the earliest entire pending group matching a user-message predicate. */
+	removeFirst(predicate: (group: readonly AgentMessage[]) => boolean): boolean {
+		const index = this.groups.findIndex(predicate);
+		if (index < 0) return false;
+		this.groups.splice(index, 1);
+		return true;
+	}
+
 	clear(): void {
 		this.groups = [];
 	}
@@ -300,6 +308,24 @@ export class Agent {
 	/** Queue a prompt batch to run together after the agent would otherwise stop. */
 	followUpGroup(messages: readonly AgentMessage[]): void {
 		this.followUpQueue.enqueueGroup(messages);
+	}
+
+	/** Remove one complete user-prompt group from the requested queue without
+	 * changing any other group, including separately queued custom messages. */
+	removeQueuedUserGroup(kind: "steer" | "followUp", text: string): boolean {
+		const queue = kind === "steer" ? this.steeringQueue : this.followUpQueue;
+		return queue.removeFirst((group) => {
+			const first = group[0];
+			return (
+				first?.role === "user" &&
+				(typeof first.content === "string"
+					? first.content
+					: first.content
+							.filter((part) => part.type === "text")
+							.map((part) => part.text)
+							.join("\n")) === text
+			);
+		});
 	}
 
 	/** Remove all queued steering messages. */
