@@ -95,6 +95,7 @@ interface AgentSession {
   thinkingLevel: ThinkingLevel;
   messages: AgentMessage[];
   isStreaming: boolean;
+  getSystemPromptSnapshot(): { systemPrompt: string; options: BuildSystemPromptOptions };
 
   // In-place tree navigation within the current session file
   navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }): Promise<{ editorText?: string; cancelled: boolean }>;
@@ -512,6 +513,15 @@ await loader.reload();
 
 const { session } = await createAgentSession({ resourceLoader: loader });
 ```
+
+Read the currently assembled **base** prompt and the inputs used to build it without sending a turn:
+
+```typescript
+const { systemPrompt, options } = session.getSystemPromptSnapshot();
+console.log(options.selectedTools, systemPrompt);
+```
+
+This read-only snapshot reflects currently active tools and loaded resources, including changes made since the last turn or after forking. Its `options` are independent copies; editing them does not change the session. It does not invoke extension handlers or include per-turn `before_agent_start` changes, provider payload rewrites, or an existing turn-specific prompt override. `session.systemPrompt` remains the effective prompt of the current/last turn.
 
 > See [examples/sdk/03-custom-prompt.ts](../examples/sdk/03-custom-prompt.ts)
 

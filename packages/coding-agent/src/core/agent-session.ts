@@ -991,6 +991,22 @@ export class AgentSession {
 		return this.agent.state.systemPrompt;
 	}
 
+	/** Snapshot Pi's current base system prompt and its inputs without starting a turn or running extension handlers. */
+	getSystemPromptSnapshot(): { systemPrompt: string; options: BuildSystemPromptOptions } {
+		const { systemPrompt, options } = this._assembleSystemPrompt(this.getActiveToolNames());
+		return {
+			systemPrompt,
+			options: {
+				...options,
+				selectedTools: [...(options.selectedTools ?? [])],
+				toolSnippets: { ...options.toolSnippets },
+				promptGuidelines: [...(options.promptGuidelines ?? [])],
+				contextFiles: options.contextFiles?.map((file) => ({ ...file })),
+				skills: options.skills?.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
+			},
+		};
+	}
+
 	/** Current retry attempt (0 if not retrying) */
 	get retryAttempt(): number {
 		return this._retryAttempt;
@@ -1195,7 +1211,10 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
-	private _rebuildSystemPrompt(toolNames: string[]): string {
+	private _assembleSystemPrompt(toolNames: string[]): {
+		systemPrompt: string;
+		options: BuildSystemPromptOptions;
+	} {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
 		const promptGuidelines: string[] = [];
@@ -1218,7 +1237,7 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
-		this._baseSystemPromptOptions = {
+		const options: BuildSystemPromptOptions = {
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -1228,7 +1247,13 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 		};
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		return { systemPrompt: buildSystemPrompt(options), options };
+	}
+
+	private _rebuildSystemPrompt(toolNames: string[]): string {
+		const { systemPrompt, options } = this._assembleSystemPrompt(toolNames);
+		this._baseSystemPromptOptions = options;
+		return systemPrompt;
 	}
 
 	// =========================================================================

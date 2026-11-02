@@ -599,6 +599,35 @@ describe("AgentSessionRuntime characterization", () => {
 		);
 	});
 
+	it("reassembles a base prompt snapshot on the replacement session after forking", async () => {
+		let beforeAgentStartCalls = 0;
+		const { runtime, tempDir } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("before_agent_start", () => {
+				beforeAgentStartCalls++;
+			});
+		});
+		await runtime.session.prompt("hello");
+		const source = runtime.session;
+		const sourceSnapshot = source.getSystemPromptSnapshot();
+		expect(sourceSnapshot.options.cwd).toBe(tempDir);
+		expect(beforeAgentStartCalls).toBe(1);
+
+		const result = await runtime.fork(source.sessionManager.getLeafId()!, { position: "at" });
+		expect(result.cancelled).toBe(false);
+		const fork = runtime.session;
+		expect(fork).not.toBe(source);
+		const messagesBefore = fork.messages.slice();
+		const entriesBefore = fork.sessionManager.getEntries();
+		const forkSnapshot = fork.getSystemPromptSnapshot();
+		expect(forkSnapshot.options.cwd).toBe(tempDir);
+		expect(forkSnapshot.options.selectedTools).toEqual(fork.getActiveToolNames());
+		expect(forkSnapshot.systemPrompt).toBe(fork.systemPrompt);
+		expect(forkSnapshot).toEqual(sourceSnapshot);
+		expect(fork.messages).toEqual(messagesBefore);
+		expect(fork.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(beforeAgentStartCalls).toBe(1);
+	});
+
 	it("duplicates the current active branch when forking at the current position", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		await runtime.session.prompt("hello");
